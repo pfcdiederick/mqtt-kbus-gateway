@@ -1,0 +1,4 @@
+# Build context of docker/mqtt-bridge/Dockerfile: only these files.
+*
+!mqtt_bridge.py
+!mqtt-bridge.ini

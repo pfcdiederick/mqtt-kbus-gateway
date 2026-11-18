@@ -1,0 +1,74 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "make (native, PC)",
+            "type": "shell",
+            "command": "make",
+            "problemMatcher": ["$gcc"],
+            "group": { "kind": "build", "isDefault": true }
+        },
+        {
+            "label": "broker for development (mosquitto on localhost:1883)",
+            "type": "shell",
+            "command": "docker rm -f mosquitto-dev >/dev/null 2>&1; docker run -d --name mosquitto-dev -p 1883:1883 eclipse-mosquitto:2.0.20 mosquitto -c /mosquitto-no-auth.conf",
+            "problemMatcher": []
+        },
+        {
+            "label": "run simulation (broker localhost:1883)",
+            "type": "shell",
+            "command": "make run-sim",
+            "problemMatcher": []
+        },
+        {
+            "label": "test: MQTT topics (simulation)",
+            "type": "shell",
+            "command": "python3 tests/test-mqtt.py 127.0.0.1 sim",
+            "problemMatcher": []
+        },
+        {
+            "label": "build-ipk: PFC300 (arm64)",
+            "type": "shell",
+            "command": "tools/build-ipk.sh arm64",
+            "problemMatcher": []
+        },
+        {
+            "label": "deploy native package to PFC (build, opkg install, status)",
+            "type": "shell",
+            "command": "tools/deploy.sh ${input:pfcIp}",
+            "problemMatcher": []
+        },
+        {
+            "label": "deploy containers: mosquitto only",
+            "type": "shell",
+            "command": "tools/deploy-docker.sh ${input:pfcIp} --mosquitto --no-gateway",
+            "problemMatcher": []
+        },
+        {
+            "label": "deploy containers: mqtt-bridge only",
+            "type": "shell",
+            "command": "tools/deploy-docker.sh ${input:pfcIp} --bridge --no-gateway",
+            "problemMatcher": []
+        },
+        {
+            "label": "deploy containers: kbus-gateway container (replaces the native service)",
+            "type": "shell",
+            "command": "tools/deploy-docker.sh ${input:pfcIp}",
+            "problemMatcher": []
+        },
+        {
+            "label": "kbus-gateway container -> native service",
+            "type": "shell",
+            "command": "tools/deploy-docker.sh ${input:pfcIp} --native",
+            "problemMatcher": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "pfcIp",
+            "type": "promptString",
+            "description": "IP address of the PFC",
+            "default": "192.168.1.17"
+        }
+    ]
+}

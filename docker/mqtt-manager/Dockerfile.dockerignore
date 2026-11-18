@@ -1,0 +1,4 @@
+# Ignore file of docker/mqtt-manager/Dockerfile (build context = project root).
+*
+!docker/mqtt-manager/mqtt_manager.py
+!web/

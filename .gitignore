@@ -1,0 +1,21 @@
+# Docker image archives (large, contain third-party binaries)
+*.tar.gz
+
+# Build output
+build/
+__pycache__/
+
+# WAGO SDK headers: proprietary ("PROPRIETARY RIGHTS ... license agreement").
+# Import them yourself with tools/import-sdk-packages.sh (see sdk/README.md).
+# OsCommon.h is our own minimal stand-in and stays in the repo.
+sdk/include/dal/
+sdk/include/ldkc_kbus_information.h
+
+# WAGO documents (download them from wago.com instead)
+docs/reference/**/*.pdf
+
+# Native packages (tools/build-ipk.sh)
+build-ipk/
+
+# Docker image archives (tools/deploy-docker.sh)
+build-docker/

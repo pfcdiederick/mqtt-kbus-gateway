@@ -1,0 +1,15 @@
+#!/bin/sh
+# Enable the service at boot and (re)start it, unless installed into an
+# offline root filesystem (e.g. by PTXdist while building a firmware image).
+[ -n "$IPKG_INSTROOT" ] && exit 0
+# Version 3 (MQTT) replaces kbus-gateway 2.x (HTTP/wdx) as a normal package upgrade.
+# Only one program may own the KBUS: warn when a container still runs a gateway.
+for c in kbus-gateway kbus-mqtt; do
+    if command -v docker >/dev/null 2>&1 && docker ps -q --filter "name=^$c\$" 2>/dev/null | grep -q .; then
+        echo "kbus-gateway: WARNING the container $c owns the KBUS; remove it: docker rm -f $c"
+    fi
+done
+mkdir -p /home/kbus-gateway
+ln -sf ../init.d/kbus-gateway /etc/rc.d/S99_kbus-gateway
+/etc/init.d/kbus-gateway restart || true
+exit 0
