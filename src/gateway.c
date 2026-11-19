@@ -607,6 +607,8 @@ int gateway_set_cycle_ms(int ms)
 void gateway_reset_stats(void)
 {
     pthread_mutex_lock(&gw.lock);
+    gw.stats.cycles = 0;                                  // counters for display only
+    gw.stats.errors = 0;
     gw.stats.max_cycle_us = 0;
     gw.stats.max_late_us = 0;
     gw.stats.overruns = 0;

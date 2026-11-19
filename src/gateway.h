@@ -74,7 +74,7 @@ size_t               gateway_module_input(size_t mi, uint8_t *buf, size_t len);
 int                  gateway_module_output(size_t mi, const uint8_t *buf, size_t len);
 void                 gateway_module_name(const kbus_module_t *m, char *buf, size_t len);
 void                 gateway_stats(gw_stats_t *out);
-void                 gateway_reset_stats(void);   // maximum values and overruns back to 0
+void                 gateway_reset_stats(void);   // cycles, errors, maximum values and overruns back to 0
 
 #define GW_CYCLE_MS_MIN 1
 #define GW_CYCLE_MS_MAX 40

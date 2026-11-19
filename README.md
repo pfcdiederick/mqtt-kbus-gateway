@@ -338,7 +338,7 @@ kbus/do/all/set                 [true,null,false]       several outputs in the S
 kbus/ao/all/set                 [1000,null,32767]
 kbus/bus/cycletime/set          1..40                   stored, survives a restart
 kbus/bus/rescan/set             true                    rescan the KBUS now
-kbus/bus/resetstatistics/set    true                    max values and overruns back to 0
+kbus/bus/resetstatistics/set    true                    cycles, errors, max values and overruns back to 0
 kbus/module/<pos>/out/set       24 bytes (binary)       raw output data of a complex module (3.8)
 ```
 
@@ -462,7 +462,7 @@ the remote brokers behind it are not shown.
 | Item | Effect |
 |---|---|
 | Cycle time + *Set* | `kbus/bus/cycletime/set`, 1–40 ms, takes effect at the next cycle and is stored |
-| *Reset statistics* | `kbus/bus/resetstatistics/set` |
+| *Reset statistics* | `kbus/bus/resetstatistics/set`: cycles, errors, longest exchange, longest wake-up delay and overruns back to 0 |
 | *Rescan KBus* | `kbus/bus/rescan/set` (after a confirmation: outputs go to 0) |
 | *Control outputs* | **control mode**: click a DO tile to switch it, AO tiles get an input field + *Set*. An orange bar shows that it is on. Off by default, off again after a reload and after 10 minutes without use |
 
