@@ -12,8 +12,9 @@ Around it, each in its own container:
 - **kbus-mosquitto**: the broker (mosquitto, configuration built in);
 - **mqtt-bridge**: subscribes to topics on **other MQTT brokers** and publishes
   them on the broker of the PFC, so data from elsewhere sits next to the KBUS data;
-- **mqtt-manager** (optional): a read-only **monitor page** at
-  `https://<pfc-ip>/mqtt`: modules, live I/O, bus timing, bridged brokers.
+- **mqtt-manager** (optional): the **KBUS Manager** page at
+  `http(s)://<pfc-ip>/kbus`, in the look of the WBM: status, modules, live
+  I/O with switching, topics, clients, cycle time, login.
 
 ```
                                     WAGO PFC300
@@ -23,7 +24,7 @@ Around it, each in its own container:
                  │                                    ▲                     │
                  │ mqtt-bridge ───publish plant/...───┘  ▲ wss, read only   │
                  │                                        │                   │
-                 │ WBM web server /mqtt ──▶ mqtt-manager (page) ◀── browser   │
+                 │ WBM web server /kbus ──▶ mqtt-manager (page) ◀── browser   │
                  └──────▲─────────────────────────────────────────────────────┘
                         │ subscribe (TLS, login)
              other brokers: plant / cloud / weather ...
@@ -50,7 +51,7 @@ replaced by MQTT (see [6](#6-how-it-was-built)).
 
 1. [How it works](#1-how-it-works)
 2. [Installation](#2-installation)
-3. [MQTT topics](#3-mqtt-topics) (3.7: the MQTT Monitor page, 3.8: 750-495)
+3. [MQTT topics](#3-mqtt-topics) (3.7: the KBUS Manager page, 3.8: 750-495)
 4. [mqtt-bridge: topics from other brokers](#4-mqtt-bridge-topics-from-other-brokers)
 5. [Configuration](#5-configuration)
 6. [How it was built](#6-how-it-was-built)
@@ -155,7 +156,7 @@ Quick route once the PC is set up (2.3):
 ```bash
 tools/deploy-docker.sh 192.168.1.17 --mosquitto --no-gateway   # PC: the broker
 tools/deploy.sh 192.168.1.17                                   # PC: build .ipk, copy, opkg install, status
-tools/deploy-docker.sh 192.168.1.17 --bridge --manager --no-gateway   # PC: mqtt-bridge (4), monitor page (3.7)
+tools/deploy-docker.sh 192.168.1.17 --bridge --manager --no-gateway   # PC: mqtt-bridge (4), KBUS Manager page (3.7)
 ```
 
 ### 2.1 Requirements on the PC
@@ -441,65 +442,75 @@ the broker and deletes those of channels that do not exist (e.g. `kbus/di/20`
 from a module that was removed while the program was stopped). The same
 happens after a rescan. So the broker always shows exactly the current node.
 
-### 3.7 MQTT Monitor page (mqtt-manager)
+### 3.7 KBUS Manager page (mqtt-manager)
 
-`https://192.168.1.17/mqtt` (or `http://`) shows the node live, in the same
-layout as the page of the wdx gateway: KBUS status, cycle time and counters in
-the header; digital inputs and outputs as tiles (green = `TRUE`, with the
-module they belong to); analog values with a bar; the module list; the bus
-timing; and the **MQTT clients connected to this broker**: kbus-gateway,
-mqtt-bridge, and every other client. The mqtt-manager follows the connection
-messages of mosquitto (`docker logs -f mosquitto`) and serves the list as
-`/mqtt/clients.json`; the page reads it every 5 s. Another client from the
-controller itself (127.0.0.1) is shown as **CODESYS** with its client id; a
-client from another device as *MQTT client* with id and address; the monitor
-pages themselves are not shown. The page reads only the local broker, and
-there only `kbus/#` and `bridge/status`; data that the bridge brings in and
-the remote brokers behind it are not shown.
+`http://192.168.1.17/kbus` (or `https://`) is the **KBUS Manager**: the same
+page as the KBUS Manager of the HTTP/wdx gateway, in the look of the
+controller's Web-based Management (WBM): tab menu, sub menu, collapsible
+panels, status bar with LEDs, the WBM's own fonts and logo, a link to the WBM
+(top right). The old address `/mqtt` redirects to `/kbus`.
 
-**Settings menu** (gear wheel, top right):
+| Tab | Page | Content |
+|---|---|---|
+| Status | KBUS Status | state, kbus-gateway online/offline, cycle time, cycles, errors, configuration version, version; timing (exchange, max. exchange, max. wake-up delay, overruns, real-time); *Reset Statistics* (login), *Rescan KBUS* |
+| | Modules | `kbus/modules`: position, name, type code, channels |
+| I/O | Process Image | DI lamps, DO lamps + ON/OFF buttons, AI/AO bars, AO input + *Set* |
+| MQTT | Topics | every topic received (`kbus/#`, `bridge/status`, `bridge/+/status`) with value and time, filter |
+| | Clients | MQTT clients connected to the broker (from mosquitto's connection log; a client from 127.0.0.1 is shown as CODESYS), state of the mqtt-bridge and its remote brokers |
+| Settings | KBUS Cycle | `kbus/bus/cycletime/set`, 1–40 ms |
+| | Login | website login on/off, user, password |
 
-| Item | Effect |
-|---|---|
-| Cycle time + *Set* | `kbus/bus/cycletime/set`, 1–40 ms, takes effect at the next cycle and is stored |
-| *Reset statistics* | `kbus/bus/resetstatistics/set`: cycles, errors, longest exchange, longest wake-up delay and overruns back to 0 |
-| *Rescan KBus* | `kbus/bus/rescan/set` (after a confirmation: outputs go to 0) |
-| *Control outputs* | **control mode**: click a DO tile to switch it, AO tiles get an input field + *Set*. An orange bar shows that it is on. Off by default, off again after a reload and after 10 minutes without use |
+Status bar LEDs: **KBUS** (running / error), **GW** (`kbus/status`), **MQTT**
+(WebSocket to the broker), **WR** (writes allowed / `MGMT_READONLY=1`),
+**Login**.
 
-The control mode protects against accidental clicks; it is **not** an access
-control. The broker (`docker/mosquitto/acl-monitor`) lets the page write the
-bus settings and `kbus/do/+/set`, `kbus/ao/+/set`, nothing else (not the raw
-module data, no topics outside `kbus/`). Port 1883 has no login either, so
-this opens nothing new; with a login on the broker, also put one on the page.
-If an application writes the outputs cyclically (CODESYS), it overrides
-clicks made on the page. The monitor is optional:
+```
+ browser ─ http(s)://<pfc>/kbus/          ─▶ WAGO web server ─▶ mqtt-manager 127.0.0.1:9080 (page + API)
+         ├ ws(s)://<pfc>/kbus/ws          ─▶ WAGO web server ─▶ mosquitto    127.0.0.1:9001 (MQTT, READ ONLY)
+         └ POST /kbus/api/publish ─▶ mqtt-manager: login check, topic + value check ─▶ mosquitto :1883
+```
+
+- **Reads** are live over MQTT/WebSocket (no polling). The WebSocket listener
+  of the broker is read only (`docker/mosquitto/acl-monitor`).
+- **Writes** go through the mqtt-manager, which checks them and publishes on
+  port 1883: `do/<n>/set`, `ao/<n>/set`, `bus/cycletime/set`,
+  `bus/rescan/set`, `bus/resetstatistics/set`; nothing else (no raw module
+  data, nothing outside the prefix).
+- **Login** (same rules as the wdx KBUS Manager): the website is open by
+  default; *Login required* on Settings > Login closes it. *Reset Statistics*
+  and changing the login settings **always** need the login (gear button, top
+  right): default `admin` / `wago` until a password is set. Stored in
+  `/home/mqtt-manager/settings.json` on the controller (password as PBKDF2
+  hash). The login protects the page; port 1883 of the broker has no login,
+  so anyone on the network can still read and write over MQTT directly.
+- **Not available over MQTT:** *Local Control* of the wdx gateway (blocking
+  all other writers) and the *Parameters* / *Registers* pages (wdx data
+  layer); the *MQTT* tab replaces them.
+- Environment (`MG_ENV` of `tools/deploy-docker.sh`): `MGMT_READONLY=1` (no
+  writes), `MQTT_TOPIC_PREFIX` (when kbus-gateway uses another prefix),
+  `MQTT_USER` / `MQTT_PASSWORD` (broker with login), `WEB_PATH` (`/kbus`),
+  `OLD_WEB_PATH` (`/mqtt`, `""` = no redirect).
 
 ```bash
-tools/deploy-docker.sh 192.168.1.17 --manager --no-gateway
-```
-
-```
- browser ─ https://<pfc>/mqtt/    ─▶ WAGO web server (lighttpd) ─▶ mqtt-manager 127.0.0.1:9080  (page)
-         └ wss://<pfc>/mqtt/ws ─▶ WAGO web server (lighttpd) ─▶ mosquitto    127.0.0.1:9001  (MQTT, ACL)
+tools/deploy-docker.sh 192.168.1.17 --mosquitto --manager --no-gateway
 ```
 
 - **No extra port**: the page uses the WBM's own web server (port 80/443, its
-  certificate). The mqtt-manager adds `/etc/lighttpd/apps.confd/mqtt.conf`,
-  WAGO's own extension point (the WBM, WebVisu and the parameter service use
-  it too). It lets lighttpd check the whole configuration (`lighttpd -tt`)
-  before reloading it and removes a rejected file at once, so the WBM is never
-  left with a broken configuration. A reload restarts lighttpd: the WBM is
-  away for about a second, only when the file changes.
+  certificate; HTTP follows the WBM's web-services mode). The mqtt-manager
+  adds `/etc/lighttpd/apps.confd/mqtt.conf`, WAGO's own extension point (the
+  WBM, WebVisu and the parameter service use it too). It lets lighttpd check
+  the whole configuration (`lighttpd -tt`) before reloading it and removes a
+  rejected file at once, so the WBM is never left with a broken configuration.
+  A reload restarts lighttpd: the WBM is away for about a second, only when
+  the file changes.
 - **Kept automatically**: the mqtt-manager checks the file every minute and puts
   it back when it is missing or different (e.g. after a firmware update). The
   container runs with `--restart unless-stopped`.
-- **Live**: the page connects with MQTT over WebSocket and subscribes to
-  everything; no polling. What it may write is limited by the broker
-  (`acl-monitor`, see above).
 - **Remove**: `docker rm -f mqtt-manager`, then
   `docker run --rm --privileged --pid host mqtt-manager:arm64 --unlink`.
-  Without the second command `/mqtt` stays linked and answers 503.
-- Options in the URL: `?prefix=line1/kbus` (other `MQTT_TOPIC_PREFIX`).
+  Without the second command `/kbus` stays linked and answers 503.
+- Do not deploy the KBUS Manager of the wdx gateway on the same controller:
+  both use `/kbus`.
 
 The container needs `--privileged --pid host`: it writes the file and reloads
 the web server on the controller (`nsenter`). The reload is run from the
@@ -615,7 +626,7 @@ values every second or so are no problem. If the function block has a
 time-out for the module's answer, set it to at least 500 ms.
 
 **One writer.** Only this CODESYS application may publish
-`kbus/module/2/out/set`. The MQTT Monitor page cannot write it (broker ACL).
+`kbus/module/2/out/set`. The KBUS Manager page cannot write it (mqtt-manager and broker ACL).
 
 **Raw data by hand** (diagnosis):
 
@@ -752,7 +763,10 @@ up to 50 messages per second each; use `MQTT_ANALOG_DEADBAND` or a longer
 3. **mqtt-bridge** (Python, paho-mqtt) for data from other brokers.
 4. **kbus-mosquitto and mqtt-manager.** The broker got its own image with the
    configuration built in; the optional mqtt-manager serves a read-only
-   monitor page (layout of the wdx page) at `/mqtt` of the WBM web server.
+   monitor page (layout of the wdx page) at `/mqtt` of the WBM web server,
+   later (2026-11-20) replaced by the KBUS Manager at `/kbus`: the same WBM-style
+   page as the wdx gateway, reading over MQTT/WebSocket, writing through the
+   mqtt-manager with the same login rules.
    Lesson learned: a lighttpd reload started from a container belongs to the
    container's cgroups and was stopped with the container (the WBM went down
    for a short time while the manager was replaced); the reload now runs from
@@ -766,7 +780,7 @@ KBUS opened by kbus-gateway only, 0 errors, 0 overruns at 5 ms (KBUS exchange
 max 1.97 ms, wake-up delay max 82 µs), `tests/test-mqtt.py ... node` and
 `write --do 1` from a PC over the network (DO1 on/off, also held for 10 s),
 the simulation suite on the PFC (35 checks), mqtt-bridge from a Home Assistant
-broker, the monitor page through `https://<pfc>/mqtt` with live data.
+broker, the KBUS Manager page through `https://<pfc>/kbus` with live data.
 
 Before that, with the simulation node and mosquitto 2.0.20 (`tests/test-mqtt.py sim`:
 35 checks, all classes, arrays, invalid commands, cycle time, rescan), plus:
@@ -808,8 +822,8 @@ inheritance.
 │   ├── gateway/               kbus-gateway as a container (2.8): Dockerfile, entrypoint.sh
 │   ├── mosquitto/             kbus-mosquitto: the broker with its configuration (2.2)
 │   ├── mqtt-bridge/           topics of other brokers -> PFC broker (section 4)
-│   └── mqtt-manager/          monitor page at /mqtt, link in the WAGO web server (3.7)
-├── web/                       the monitor page: index.html, monitor.js, monitor.css
+│   └── mqtt-manager/          KBUS Manager page at /kbus + API, link in the WAGO web server (3.7)
+├── web/                       the KBUS Manager page: index.html, kbus.js, kbus.css
 ├── codesys/                   using the KBUS from CODESYS through MQTT
 ├── tools/
 │   ├── build-ipk.sh           build the .ipk with the SDK toolchain (2.4)
@@ -876,8 +890,8 @@ section 3.
 | `kbus/status` is `offline` while the program runs | it is reconnecting (log), or another prefix is configured |
 | Old channel topics stay | retained topics of a different prefix are not cleaned; delete with `mosquitto_pub -r -n -t <topic>` |
 | PC cannot connect to the broker | port 1883 blocked by the PFC firewall, or another `mosquitto.conf` with `listener 1883 127.0.0.1` |
-| `https://<pfc>/mqtt` gives 404 | the mqtt-manager is not running or has not linked yet: `docker logs mqtt-manager` |
-| `https://<pfc>/mqtt` gives 503 | the mqtt-manager was removed but the link is still there: `--unlink` (3.7), or start it again |
+| `https://<pfc>/kbus` gives 404 | the mqtt-manager is not running or has not linked yet: `docker logs mqtt-manager` |
+| `https://<pfc>/kbus` gives 503 | the mqtt-manager was removed but the link is still there: `--unlink` (3.7), or start it again |
 | Monitor page: "connecting…" / "offline" | the broker (kbus-mosquitto, WebSocket listener 127.0.0.1:9001) is not running |
 | Monitor page: "kbus-gateway offline" | kbus-gateway is stopped or cannot reach the broker; the page shows its last values |
 | `opening the KBUS device failed` | another program owns the KBUS: runtime not *None*, a CODESYS project with KBUS, an old gateway container, or the kbus-gateway container and the native service at once |
@@ -912,8 +926,8 @@ section 3.
   isolated machine network; otherwise add user names, passwords and an ACL
   (end of `docker/mosquitto/mosquitto.conf`), use `MQTT_WRITE_ENABLE=0` when no
   outputs need to be written, block port 1883 in the PFC firewall for other
-  networks, and use TLS on networks you do not control. The monitor page
-  (3.7) itself is read only.
+  networks, and use TLS on networks you do not control. The KBUS Manager page
+  (3.7) writes only through the mqtt-manager (topic whitelist, optional login).
 - No supervision of writers: outputs keep their last value when the writing
   client disappears (3.5).
 - MQTT is fast but not hard real-time; for hard real-time I/O let CODESYS

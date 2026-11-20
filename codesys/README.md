@@ -44,7 +44,7 @@ Recommendations:
   kbus-gateway keeps the value. After a restart of kbus-gateway (`kbus/status`
   `offline` → `online`) all outputs are 0: write them again.
 - Values are raw: a 750-559 (0–10 V) has 32767 at 10 V.
-- Check the result live at `https://<pfc-ip>/mqtt` (monitor page).
+- Check the result live at `https://<pfc-ip>/kbus` (KBUS Manager page).
 
 ## The 750-495 with the standard WAGO function block
 

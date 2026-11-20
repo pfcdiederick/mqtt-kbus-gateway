@@ -1,84 +1,157 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MQTT Monitor</title>
+<title>KBUS Manager</title>
 <!--
-  MQTT monitor of the kbus-gateway, served at https://<pfc-ip>/mqtt/ by the mqtt-manager (through the
-  WAGO web server). Live via MQTT over WebSocket (wss://<pfc-ip>/mqtt/ws): subscribes to kbus/#
-  and the status of the mqtt-bridge on the local broker only, no polling. Writes: the bus settings (cycle time, rescan, reset statistics) and, only in the
-  control mode, the outputs (kbus/do/+/set, kbus/ao/+/set). Same layout as the web page of the wdx gateway. No external files: works on a
-  machine network without internet. Scripts and styles are separate files because the WAGO
-  web server sends Content-Security-Policy: default-src 'self'.
+  KBUS Manager of the kbus-gateway (MQTT), served at http(s)://<pfc-ip>/kbus/ by the mqtt-manager
+  (through the WAGO web server). Same layout as the KBUS Manager of the HTTP/wdx gateway, in the
+  look of the controller's Web-based Management (WBM).
+  Reads: live via MQTT over WebSocket (ws(s)://<pfc-ip>/kbus/ws, read only): kbus/# and bridge status.
+  Writes: through the mqtt-manager (POST api/publish), which checks the login and publishes on the broker.
+  No external files: works on a machine network without internet. Scripts and styles are separate
+  files because the WAGO web server sends Content-Security-Policy: default-src 'self'.
 -->
-<link rel="stylesheet" href="monitor.css">
-<script src="monitor.js" defer></script>
+<link rel="icon" href="wbm-assets/images/favicon.png">
+<link rel="stylesheet" href="kbus.css">
+<script src="kbus.js" defer></script>
 </head>
 <body>
-<header>
-  <h1>MQTT Monitor</h1>
-  <span class="stat"><span id="dot" class="dot"></span><span id="conn">connecting…</span></span>
-  <span class="stat">KBUS <b id="healthy">–</b></span>
-  <span class="stat">cycle <b id="cycletime">–</b> ms</span>
-  <span class="stat">cycles <b id="cycles">–</b></span>
-  <span class="stat">errors <b id="errors">–</b></span>
-  <span class="stat">configuration <b id="config">–</b></span>
-  <span class="stat host" id="host"></span>
-  <div class="settings">
-    <button type="button" id="gear" class="gear" title="Settings" aria-label="Settings"
-            aria-haspopup="true" aria-expanded="false" aria-controls="menu">
-      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.48.48 0 0 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z"/></svg>
-    </button>
-    <div id="menu" class="menu hidden" role="menu" aria-label="KBUS settings">
-      <h3>KBUS settings</h3>
-      <label for="ct">Cycle time</label>
-      <div class="row">
-        <input type="number" id="ct" min="1" max="40" step="1"> <span class="note">ms</span>
-        <button type="button" id="ct-set">Set</button>
+<div id="frame">
+  <div id="main-header">
+    <div id="logo"><img id="logo-img" src="wbm-assets/images/wago-logo.svg" alt=""><span class="text">KBUS</span></div>
+    <ul id="main-menu"></ul>
+    <ul id="action-bar">
+      <li><a id="login-btn" role="button" tabindex="0" title="Log in"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg></a>
+        <label id="login-label">Login</label></li>
+      <li><a id="wbm-link" href="/" target="_blank" rel="noopener" title="Web-based Management of the controller">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 19H5V5h7V3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg></a>
+        <label>WBM</label></li>
+    </ul>
+  </div>
+
+  <div id="main-content">
+    <ul class="sub-menu" id="sub-menu"></ul>
+    <div class="sub-content">
+      <p id="msg"></p>
+
+      <!-- Status / KBUS Status -->
+      <div class="wbm-page" id="page-status-kbus">
+        <h2 class="page">KBUS Status</h2>
+        <div class="form collapsible"><span class="title">KBUS</span><div class="body">
+          <div class="field"><label>State</label><div class="control" id="st-healthy">–</div></div>
+          <div class="field"><label>kbus-gateway</label><div class="control" id="st-gateway">–</div></div>
+          <div class="field"><label>Cycle Time</label><div class="control value" id="st-cycletime">–</div></div>
+          <div class="field"><label>Cycles</label><div class="control value" id="st-cycles">–</div></div>
+          <div class="field"><label>Errors</label><div class="control value" id="st-errors">–</div></div>
+          <div class="field"><label>Configuration Version</label><div class="control value" id="st-configversion">–</div></div>
+          <div class="field"><label>Version</label><div class="control value" id="st-version">–</div></div>
+          <div class="buttons"><button class="w auth-only" id="reset" title="Cycles, errors, maximum values and overruns back to 0">Reset Statistics</button> <button class="w assertive" id="rescan">Rescan KBUS</button></div>
+        </div></div>
+        <div class="form collapsible"><span class="title">Timing</span><div class="body">
+          <div class="field"><label>KBUS Exchange</label><div class="control value" id="st-cycleDuration">–</div></div>
+          <div class="field"><label>Max. KBUS Exchange</label><div class="control value" id="st-maxCycleDuration">–</div></div>
+          <div class="field"><label>Max. Wake-up Delay</label><div class="control value" id="st-maxWakeupDelay">–</div></div>
+          <div class="field"><label>Overruns</label><div class="control value" id="st-overruns">–</div></div>
+          <div class="field"><label>Real-time</label><div class="control value" id="st-realtime">–</div></div>
+        </div></div>
       </div>
-      <p class="note small">1–40 ms. Takes effect at the next cycle and is stored.</p>
-      <hr>
-      <button type="button" id="reset" class="item" role="menuitem">Reset statistics</button>
-      <button type="button" id="rescan" class="item" role="menuitem"
-              title="Read the modules on the KBUS again (outputs go to 0 briefly)">Rescan KBus</button>
-      <hr>
-      <button type="button" id="control" class="item" role="menuitemcheckbox" aria-checked="false">Control outputs</button>
-      <p class="warn"><b>Warning:</b> controlling the outputs can disturb the running process.</p>
+
+      <!-- Status / Modules -->
+      <div class="wbm-page" id="page-status-modules">
+        <h2 class="page">KBUS Modules</h2>
+        <div class="form wide"><span class="title">Modules on the KBUS</span><div class="body">
+          <table class="grid"><thead><tr><th>#</th><th>Name</th><th>Type Code</th><th>Channels</th></tr></thead>
+            <tbody id="modules"></tbody></table>
+        </div></div>
+      </div>
+
+      <!-- I/O / Process Image -->
+      <div class="wbm-page" id="page-io-process">
+        <h2 class="page">Process Image</h2>
+        <p class="note">Live values of all KBUS channels. Outputs are switched at once (<code>kbus/do/&lt;n&gt;/set</code>);
+          another program that writes the same outputs cyclically (e.g. CODESYS) overwrites them in its next cycle.</p>
+        <div class="form wide"><span class="title">Digital Inputs</span><div class="body"><div class="io-grid" id="io-di"></div></div></div>
+        <div class="form wide"><span class="title">Digital Outputs</span><div class="body"><div class="io-grid" id="io-do"></div></div></div>
+        <div class="form wide"><span class="title">Analog Inputs (raw 0–65535)</span><div class="body"><div class="analog" id="io-ai"></div></div></div>
+        <div class="form wide"><span class="title">Analog Outputs (raw 0–65535)</span><div class="body"><div class="analog" id="io-ao"></div></div></div>
+      </div>
+
+      <!-- MQTT / Topics -->
+      <div class="wbm-page" id="page-mqtt-topics">
+        <h2 class="page">MQTT Topics</h2>
+        <div class="form wide"><span class="title">Topics on the Broker</span><div class="body">
+          <div class="toolbar"><input type="search" id="tfilter" placeholder="Filter by topic"><span id="tcount"></span></div>
+          <table class="grid"><thead><tr><th>Topic</th><th>Value</th><th>Updated</th></tr></thead>
+            <tbody id="ttable"></tbody></table>
+        </div></div>
+        <p class="note">Everything the page receives: <code id="sub-list">kbus/#</code>. Write topics (<code>…/set</code>) are not retained and therefore not listed.</p>
+      </div>
+
+      <!-- MQTT / Clients -->
+      <div class="wbm-page" id="page-mqtt-clients">
+        <h2 class="page">MQTT Clients</h2>
+        <div class="form wide"><span class="title">Clients Connected to this Broker</span><div class="body">
+          <table class="grid"><thead><tr><th>Client</th><th>Client Id</th><th>Address</th><th>Connected Since</th></tr></thead>
+            <tbody id="ctable"></tbody></table>
+        </div></div>
+        <div class="form wide"><span class="title">mqtt-bridge</span><div class="body">
+          <table class="grid"><thead><tr><th>Connection</th><th>State</th></tr></thead>
+            <tbody id="btable"></tbody></table>
+        </div></div>
+        <p class="note">The clients come from the broker's connection log (mqtt-manager). Another client on this
+          controller (127.0.0.1) is shown as CODESYS; the KBUS Manager pages themselves are not shown.</p>
+      </div>
+
+      <!-- Settings / KBUS Cycle -->
+      <div class="wbm-page" id="page-settings-cycle">
+        <h2 class="page">KBUS Cycle</h2>
+        <p class="note">Changes take effect at the next cycle and are kept after a restart (<code>kbus/bus/cycletime/set</code>).</p>
+        <div class="form collapsible"><span class="title">Cycle Time</span><div class="body">
+          <div class="field"><label>Current Cycle Time</label><div class="control value" id="cyc-now">–</div></div>
+          <div class="field"><label>New Cycle Time (ms)</label><div class="control"><input type="number" id="cyc" min="1" max="40" step="1"></div></div>
+          <div class="buttons"><button class="w action" id="cycset">Submit</button></div>
+        </div></div>
+      </div>
+
+      <!-- Settings / Login -->
+      <div class="wbm-page" id="page-settings-login">
+        <h2 class="page">Login</h2>
+        <p class="note" id="sstate">–</p>
+        <p class="note anon-only">Log in (gear button at the top right) to change the login settings.</p>
+        <form class="form collapsible auth-only" id="sform" autocomplete="off"><span class="title">Website Login</span><div class="body">
+          <div class="field"><label for="slogin">Login required</label><div class="control"><input type="checkbox" id="slogin"></div></div>
+          <div class="field"><label for="suser">User</label><div class="control"><input type="text" id="suser" maxlength="32" autocomplete="username"></div></div>
+          <div class="field"><label for="spw">New Password</label><div class="control"><input type="password" id="spw" maxlength="128" autocomplete="new-password" placeholder="empty = keep the current one"></div></div>
+          <div class="field"><label for="spw2">Repeat Password</label><div class="control"><input type="password" id="spw2" maxlength="128" autocomplete="new-password"></div></div>
+          <div class="buttons"><span id="snote"></span><button type="submit" class="action">Submit</button></div>
+        </div></form>
+        <p class="note">Stored on the controller, the password only as a hash. The login protects this website and
+          its writes; the MQTT port 1883 of the broker has no login of its own (see the broker configuration).</p>
+      </div>
     </div>
   </div>
-</header>
-<main>
-  <div id="ctlbar" class="ctlbar hidden" role="alert">
-    <span>Control mode: clicking a DO tile or setting an AO value switches the <b>real output</b>.</span>
-    <button type="button" id="ctl-off">Turn off</button>
+
+  <div id="status-area">
+    <div id="clock">–<br>–</div>
+    <div class="led-table">
+      <div class="led-item" id="led-kbus" title="KBUS"><div class="led"></div>KBUS</div>
+      <div class="led-item" id="led-gw" title="kbus-gateway"><div class="led"></div>GW</div>
+      <div class="led-item" id="led-mqtt" title="MQTT broker"><div class="led"></div>MQTT</div>
+      <div class="led-item" id="led-wr" title="Writes"><div class="led"></div>WR</div>
+      <div class="led-item" id="led-login" title="Login"><div class="led"></div>Login</div>
+    </div>
+    <div id="status-text"></div>
   </div>
-  <div id="msg"></div>
-  <section id="sec-di" class="hidden"><h2>Digital inputs</h2><div id="di" class="grid"></div></section>
-  <section id="sec-do" class="hidden"><h2>Digital outputs</h2><div id="do" class="grid"></div></section>
-  <section id="sec-ai" class="hidden"><h2>Analog inputs <span class="note">(raw 0–65535)</span></h2><div id="ai" class="ana"></div></section>
-  <section id="sec-ao" class="hidden"><h2>Analog outputs <span class="note">(raw 0–65535)</span></h2><div id="ao" class="ana"></div></section>
-  <section><h2>Modules</h2>
-    <table><thead><tr><th>#</th><th>Module</th><th>Type code</th><th>Channels</th></tr></thead>
-      <tbody id="mods"><tr><td colspan="4">waiting for kbus-gateway …</td></tr></tbody></table>
-  </section>
-  <section><h2>Timing</h2>
-    <table><tbody>
-      <tr><th>Last KBUS exchange</th><td id="t-last">–</td><th>Overruns</th><td id="t-overruns">–</td></tr>
-      <tr><th>Longest KBUS exchange</th><td id="t-max">–</td><th>Real-time</th><td id="t-rt">–</td></tr>
-      <tr><th>Longest wake-up delay</th><td id="t-wake">–</td><th>kbus-gateway version</th><td id="t-version">–</td></tr>
-    </tbody></table>
-  </section>
-  <section><h2>MQTT clients connected to this broker</h2><div id="connected" class="grid wide"></div></section>
-  <p class="note">
-    Live values from the MQTT broker of this controller: the page subscribes only to
-    <code id="prefix">kbus</code><code>/#</code> (kbus-gateway) and <code>bridge/status</code> (mqtt-bridge).
-    The connected clients come from the broker's connection log (mqtt-manager); another client
-    on this controller is shown as CODESYS.
-    Outputs are switched with <code>kbus/do/&lt;n&gt;/set</code> by your applications; from this page only
-    with the control mode switched on (gear wheel, top right). If an application writes the outputs
-    cyclically (e.g. CODESYS), it overrides clicks made here.
-  </p>
-</main>
+</div>
+<div id="login-dlg"><form id="login-form" autocomplete="on">
+  <h3>Login</h3>
+  <p id="login-why">Reset Statistics and the login settings need the login.</p>
+  <label for="login-user">User</label><input type="text" id="login-user" autocomplete="username">
+  <label for="login-pw">Password</label><input type="password" id="login-pw" autocomplete="current-password">
+  <div id="login-err"></div>
+  <div class="buttons"><button type="button" id="login-cancel">Cancel</button><button type="submit" class="action">Log in</button></div>
+</form></div>
 </body>
 </html>

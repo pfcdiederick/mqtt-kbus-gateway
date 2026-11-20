@@ -15,7 +15,7 @@ it back.
  KBUS ◀─────────▶ kbus-gateway ─────┘         :9001 (WebSocket, read only, 127.0.0.1)
                   (gateway/: container,        ▲
                    or the native .ipk)         │
- browser ─ https://<pfc>/mqtt ─ WBM web server ┴─ mqtt-manager (page, 127.0.0.1:9080)
+ browser ─ https://<pfc>/kbus ─ WBM web server ┴─ mqtt-manager (page, 127.0.0.1:9080)
 ```
 
 | Folder | Image | Role | Needed? |
@@ -23,7 +23,7 @@ it back.
 | [gateway/](gateway/) | `kbus-gateway:<version>-<arch>` | owns the KBUS, publishes it on MQTT, writes outputs from `.../set` | one kbus-gateway: this container **or** the native package (`tools/build-ipk.sh`) |
 | [mosquitto/](mosquitto/) | `kbus-mosquitto:<arch>` | the broker, configuration built in ([mosquitto.conf](mosquitto/mosquitto.conf)) | when mosquitto is not installed otherwise |
 | [mqtt-bridge/](mqtt-bridge/README.md) | `mqtt-bridge:<arch>` | subscribes on other brokers, publishes on the PFC broker | optional |
-| [mqtt-manager/](mqtt-manager/) | `mqtt-manager:<arch>` | monitor page at `https://<pfc>/mqtt` (read only), keeps `/mqtt` linked in the WAGO web server | optional |
+| [mqtt-manager/](mqtt-manager/) | `mqtt-manager:<arch>` | KBUS Manager page at `http(s)://<pfc>/kbus` (WBM layout, login), keeps `/kbus` linked in the WAGO web server | optional |
 
 **Build context:** `gateway/` and `mqtt-manager/` build from the project root
 (`src/` + `sdk/`, `web/`; ignore files `<folder>/Dockerfile.dockerignore`),
@@ -40,7 +40,7 @@ tools/deploy-docker.sh 192.168.1.17                               # kbus-gateway
 tools/deploy-docker.sh 192.168.1.17 --sim                         # the same in simulation mode (no KBUS access)
 tools/deploy-docker.sh 192.168.1.17 --mosquitto --no-gateway      # only the broker
 tools/deploy-docker.sh 192.168.1.17 --bridge --no-gateway         # only the mqtt-bridge
-tools/deploy-docker.sh 192.168.1.17 --manager --no-gateway        # only the monitor page
+tools/deploy-docker.sh 192.168.1.17 --manager --no-gateway        # only the KBUS Manager page
 tools/deploy-docker.sh 192.168.1.17 --mosquitto --bridge --manager   # everything
 SKIP_BUILD=1 tools/deploy-docker.sh ...                            # reuse the archives in build-docker/
 tools/deploy-docker.sh 192.168.1.17 --native                      # kbus-gateway container -> native service again
@@ -56,4 +56,4 @@ docker buildx build --platform linux/arm64 -f docker/mqtt-manager/Dockerfile -t 
 ```
 
 Details: main [README](../README.md) 2.2 (broker), 2.8 (kbus-gateway container),
-3.7 (monitor page), 4 (mqtt-bridge).
+3.7 (KBUS Manager page), 4 (mqtt-bridge).

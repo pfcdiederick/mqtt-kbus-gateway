@@ -1,56 +1,295 @@
-"""mqtt-manager: the MQTT monitor page at https://<pfc>/mqtt/ (optional container).
+"""mqtt-manager: the KBUS Manager page at http(s)://<pfc>/kbus/ (optional container).
 
-  browser ── https://<pfc>/mqtt/    ─▶ WAGO web server (lighttpd) ─▶ mqtt-manager 127.0.0.1:9080 (the page)
-          └─ wss://<pfc>/mqtt/ws ─▶ WAGO web server (lighttpd) ─▶ mosquitto  127.0.0.1:9001 (MQTT, read only)
+  browser ── http(s)://<pfc>/kbus/   ─▶ WAGO web server (lighttpd) ─▶ mqtt-manager 127.0.0.1:9080 (page + API)
+          └─ ws(s)://<pfc>/kbus/ws ─▶ WAGO web server (lighttpd) ─▶ mosquitto  127.0.0.1:9001 (MQTT, read only)
 
-Three jobs:
+The page has the layout of the controller's Web-based Management (WBM), like the
+KBUS Manager of the HTTP/wdx gateway. It READS everything live over MQTT/WebSocket;
+every WRITE goes through this program (POST /api/publish), which checks the login
+and publishes on the broker (MQTT_HOST:MQTT_PORT). The WebSocket listener of the
+broker is read only (docker/mosquitto/acl-monitor).
+
+Jobs:
 0. Report the MQTT clients connected to the broker: /clients.json (from mosquitto's log).
-1. Serve the page (web/: index.html, monitor.js, monitor.css) on MANAGER_BIND:MANAGER_PORT.
-2. Link /mqtt in the WAGO web server and keep it linked: write
+1. Serve the page (web/: index.html, kbus.js, kbus.css) and its API on MANAGER_BIND:MANAGER_PORT:
+     /api/settings   GET: login settings, topic prefix, read-only; POST JSON {login, user, password} (login)
+     /api/login      GET with Authorization: check user + password (login dialog)
+     /api/publish    POST JSON {topic, value}: write an output or a bus setting
+     /api/info       date and time of the controller (status bar)
+     /wbm-assets/... fonts, logo and favicon of the controller's own WBM (look of the page)
+2. Link /kbus in the WAGO web server and keep it linked: write
    /etc/lighttpd/apps.confd/mqtt.conf on the controller, let lighttpd check the whole
    configuration (lighttpd -tt), reload it. Checked again every LINK_CHECK_S seconds, so
    the link comes back by itself (e.g. after a firmware update). A configuration that
    lighttpd rejects is removed again at once, so the WBM is never left broken.
+   The old address /mqtt is redirected to /kbus.
    Needs --privileged --pid host: the commands run on the controller through nsenter.
 
     python mqtt_manager.py            serve + keep the link (the container's default)
-    python mqtt_manager.py --unlink   remove /mqtt from the web server and exit
+    python mqtt_manager.py --unlink   remove /kbus from the web server and exit
+
+Login (same rules as the KBUS Manager of the wdx gateway): the website is open by
+default ("Login required" on Settings > Login closes it). Reset Statistics and
+changing the login settings ALWAYS need the login: user and password from
+MGMT_DATA/settings.json (password only as a PBKDF2 hash), default admin / wago until
+a password is set. Mount MGMT_DATA (/home/mqtt-manager) so it survives a new container.
 
 Environment: MANAGER_BIND (127.0.0.1), MANAGER_PORT (9080), MQTT_WS_PORT (9001),
-WEB_PATH (/mqtt), LINK (1; 0 = only serve), LINK_CHECK_S (60).
+WEB_PATH (/kbus), OLD_WEB_PATH (/mqtt, redirected; "" = off), LINK (1; 0 = only serve),
+LINK_CHECK_S (60), MQTT_HOST (127.0.0.1), MQTT_PORT (1883), MQTT_USER / MQTT_PASSWORD
+(broker login, if any), MQTT_TOPIC_PREFIX (kbus), MGMT_DATA (/data), MGMT_READONLY (0),
+MGMT_DEFAULT_USER / MGMT_DEFAULT_PASSWORD (admin / wago), MGMT_WBM_URL (https://127.0.0.1/wbm).
 """
 import argparse
+import base64
 import hashlib
+import hmac
 import http.server
 import json
 import logging
 import os
 import re
 import signal
+import socket
+import ssl
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 
 WEB_DIR = os.environ.get("WEB_DIR", "/app/www")
 BIND = os.environ.get("MANAGER_BIND", "127.0.0.1")
 PORT = int(os.environ.get("MANAGER_PORT", "9080"))
 WS_PORT = int(os.environ.get("MQTT_WS_PORT", "9001"))
-WEB_PATH = "/" + os.environ.get("WEB_PATH", "/mqtt").strip("/")
+WEB_PATH = "/" + os.environ.get("WEB_PATH", "/kbus").strip("/")
+OLD_WEB_PATH = os.environ.get("OLD_WEB_PATH", "/mqtt").strip("/")
+OLD_WEB_PATH = "/" + OLD_WEB_PATH if OLD_WEB_PATH and "/" + OLD_WEB_PATH != WEB_PATH else ""
 LINK = os.environ.get("LINK", "1") == "1"
 LINK_CHECK_S = int(os.environ.get("LINK_CHECK_S", "60"))
 CONF_DIR = "/etc/lighttpd/apps.confd"
 CONF = f"{CONF_DIR}/mqtt.conf"
 MOSQUITTO = os.environ.get("MOSQUITTO_CONTAINER", "mosquitto")
+MQTT_HOST = os.environ.get("MQTT_HOST", "127.0.0.1")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+MQTT_USER = os.environ.get("MQTT_USER", "")
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
+TOPIC_PREFIX = os.environ.get("MQTT_TOPIC_PREFIX", "kbus").strip("/") or "kbus"
+READONLY = os.environ.get("MGMT_READONLY", "0") == "1"
+DATA = os.environ.get("MGMT_DATA", "/data")
+SETTINGS_FILE = os.path.join(DATA, "settings.json")
+DEFAULT_USER = os.environ.get("MGMT_DEFAULT_USER", "admin")
+DEFAULT_PASSWORD = os.environ.get("MGMT_DEFAULT_PASSWORD", "wago")
 
 log = logging.getLogger("mqtt-manager")
 stop = threading.Event()
 
 
 # ---------------------------------------------------------------------------
-# The page
+# Login settings (as in the KBUS Manager of the wdx gateway)
+# ---------------------------------------------------------------------------
+ITERATIONS = 100_000              # PBKDF2; checked once per credential, then cached
+USER_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,32}$")
+
+
+def hash_password(pw, salt=None):
+    salt = salt or os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, ITERATIONS)
+    return f"pbkdf2_sha256${ITERATIONS}${salt.hex()}${dk.hex()}"
+
+
+def check_password(pw, stored):
+    try:
+        _, it, salt, dk = stored.split("$")
+        got = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), int(it))
+        return hmac.compare_digest(got.hex(), dk)
+    except (ValueError, AttributeError):
+        return False
+
+
+class Settings:
+    """login on/off, user, password hash; stored in settings.json."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.login, self.user, self.pw_hash = False, DEFAULT_USER, ""
+        self.ok_cache = set()           # sha256 of accepted Authorization headers
+        self.source = "default"
+        damaged = False
+        try:
+            with open(SETTINGS_FILE) as f:
+                d = json.load(f)
+            self.login, self.user, self.pw_hash = bool(d["login"]), d["user"], d.get("password", "")
+            self.source = SETTINGS_FILE
+        except FileNotFoundError:
+            pass
+        except (ValueError, KeyError, TypeError) as e:
+            # damaged file: fail closed rather than open
+            log.error("%s unreadable (%s): login required, but no password works; fix or delete the file",
+                      SETTINGS_FILE, e)
+            self.login, self.pw_hash, damaged = True, "", True
+            self.source = "damaged settings file"
+        if not damaged:
+            if self.login and not self.pw_hash:
+                self.login = False
+            if not self.pw_hash:
+                # no password set yet: the default login (Reset Statistics, login settings)
+                self.user, self.pw_hash = DEFAULT_USER, hash_password(DEFAULT_PASSWORD)
+        self.default_pw = bool(self.pw_hash) and check_password(DEFAULT_PASSWORD, self.pw_hash)
+
+    def public(self):
+        return {"login": self.login, "user": self.user, "passwordSet": bool(self.pw_hash),
+                "defaultPassword": self.default_pw, "stored": os.path.isfile(SETTINGS_FILE),
+                "prefix": TOPIC_PREFIX, "readonly": READONLY}
+
+    def check(self, header):
+        """Access to the website: free while the login is off."""
+        return not self.login or self.verify(header)
+
+    def verify(self, header):
+        """Valid user and password (always checked: protected functions)."""
+        if not header.startswith("Basic "):
+            return False
+        key = hashlib.sha256(header.encode()).digest()
+        with self.lock:
+            if key in self.ok_cache:
+                return True
+            user, pw_hash = self.user, self.pw_hash
+        try:
+            user_in, _, pw = base64.b64decode(header[6:]).decode().partition(":")
+        except (ValueError, UnicodeDecodeError):
+            return False
+        ok = hmac.compare_digest(user_in.encode(), user.encode()) and check_password(pw, pw_hash)
+        if ok:
+            with self.lock:
+                if self.pw_hash == pw_hash:
+                    self.ok_cache.add(key)
+        return ok
+
+    def update(self, login, user, password):
+        """Validate and store; returns an error text or None."""
+        if not isinstance(login, bool):
+            return "login must be true or false"
+        user = (user or "").strip() or self.user
+        if not USER_RE.match(user):
+            return "user: 1-32 characters A-Z a-z 0-9 _ . @ -"
+        if password is not None and not isinstance(password, str):
+            return "password must be text"
+        if password:
+            if len(password) < 4 or len(password) > 128:
+                return "password: 4-128 characters"
+            new_hash = hash_password(password)
+        else:
+            new_hash = self.pw_hash
+        if login and not new_hash:
+            return "enter a password to switch the login on"
+        os.makedirs(DATA, exist_ok=True)
+        tmp = SETTINGS_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"login": login, "user": user, "password": new_hash}, f)
+        os.replace(tmp, SETTINGS_FILE)
+        default_pw = check_password(DEFAULT_PASSWORD, new_hash)
+        with self.lock:
+            self.login, self.user, self.pw_hash = login, user, new_hash
+            self.default_pw = default_pw
+            self.ok_cache.clear()
+            self.source = SETTINGS_FILE
+        return None
+
+
+SETTINGS = None                     # created in main() (after logging is set up)
+
+
+# ---------------------------------------------------------------------------
+# Writes: a minimal MQTT 3.1.1 publisher (QoS 0, not retained), one connection per write
+# ---------------------------------------------------------------------------
+def _mqtt_str(b: bytes) -> bytes:
+    return len(b).to_bytes(2, "big") + b
+
+
+def _mqtt_packet(head: int, body: bytes) -> bytes:
+    n, rl = len(body), bytearray()
+    while True:
+        b, n = n % 128, n // 128
+        rl.append(b | (128 if n else 0))
+        if not n:
+            return bytes([head]) + bytes(rl) + body
+
+
+def mqtt_publish(topic: str, payload: str):
+    """Publish one message on the broker; raises OSError on failure."""
+    flags, extra = 0x02, b""                                      # clean session
+    if MQTT_USER:
+        flags |= 0x80
+        extra += _mqtt_str(MQTT_USER.encode())
+        if MQTT_PASSWORD:
+            flags |= 0x40
+            extra += _mqtt_str(MQTT_PASSWORD.encode())
+    cid = f"kbus-manager-{os.getpid()}-{threading.get_ident() % 100000}".encode()
+    connect = _mqtt_packet(0x10, _mqtt_str(b"MQTT") + bytes([4, flags, 0, 10]) + _mqtt_str(cid) + extra)
+    with socket.create_connection((MQTT_HOST, MQTT_PORT), timeout=3) as s:
+        s.sendall(connect)
+        ack = b""
+        while len(ack) < 4:
+            chunk = s.recv(4 - len(ack))
+            if not chunk:
+                raise OSError("broker closed the connection")
+            ack += chunk
+        if ack[0] != 0x20 or ack[3] != 0:
+            raise OSError(f"broker refused the connection (code {ack[3]})")
+        s.sendall(_mqtt_packet(0x30, _mqtt_str(topic.encode()) + payload.encode()))
+        s.sendall(b"\xe0\x00")                                    # DISCONNECT
+
+
+# topics the page may write (relative to the prefix) and the check of the value
+def _bool(v):
+    return v in (True, False)
+
+
+WRITABLE = [
+    (re.compile(r"^do/[1-9][0-9]{0,2}/set$"), _bool, False),
+    (re.compile(r"^ao/[1-9][0-9]{0,2}/set$"), lambda v: isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 65535, False),
+    (re.compile(r"^bus/cycletime/set$"), lambda v: isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 40, False),
+    (re.compile(r"^bus/rescan/set$"), lambda v: v is True, False),
+    (re.compile(r"^bus/resetstatistics/set$"), lambda v: v is True, True),      # needs the login
+]
+
+
+# ---------------------------------------------------------------------------
+# Look of the WBM: fonts and logo come from the controller's own WBM
+# (not part of this project; fetched once, kept in memory; without them the page
+# uses system fonts and a text logo)
+# ---------------------------------------------------------------------------
+WBM_URL = os.environ.get("MGMT_WBM_URL", "https://127.0.0.1/wbm").rstrip("/")   # --network host
+WBM_ASSETS = {
+    "images/wago-logo.svg": "image/svg+xml",
+    "images/favicon.png": "image/png",
+    **{f"fonts/open-sans-latin-{w}.woff2": "font/woff2" for w in ("300", "400", "400italic", "600", "700")},
+}
+_asset_cache = {}                       # path -> (time, bytes or None)
+
+
+def wbm_asset(path):
+    t, data = _asset_cache.get(path, (0, None))
+    if data is not None or time.time() - t < 60:          # failures are retried after 60 s
+        return data
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE   # the controller's self-signed certificate
+    try:
+        with urllib.request.urlopen(f"{WBM_URL}/{path}", context=ctx, timeout=3) as r:
+            data = r.read(2_000_000) if r.status == 200 else None
+    except (OSError, ValueError):
+        data = None
+    _asset_cache[path] = (time.time(), data)
+    return data
+
+
+# ---------------------------------------------------------------------------
+# The page and its API
 # ---------------------------------------------------------------------------
 class Handler(http.server.SimpleHTTPRequestHandler):
+    server_version = "kbus-manager"
     extensions_map = {
         ".html": "text/html; charset=utf-8",
         ".js": "text/javascript; charset=utf-8",
@@ -64,35 +303,143 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=WEB_DIR, **kw)
 
-    def do_GET(self):
-        # https://<pfc>/mqtt (no "/"): the web server passes it on unmapped -> redirect to "/",
-        # which the web server maps back to /mqtt/ (proxy map-urlpath also maps Location)
-        if self.path.split("?")[0] == WEB_PATH:
-            self.send_response(301)
-            self.send_header("Location", "/" + self.path[len(WEB_PATH):].lstrip("/"))
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        if self.path.split("?")[0] == "/clients.json":
-            body = json.dumps(clients.snapshot()).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
+    def send(self, status, ctype, body, extra=None, cache=False):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self._cache = cache
+        self.end_headers()
+        if self.command != "HEAD":
             self.wfile.write(body)
-            return
+
+    def send_json(self, status, obj, extra=None):
+        self.send(status, "application/json", json.dumps(obj).encode(), extra)
+
+    def redirect(self, location):
+        self.send(301, "text/plain", b"", {"Location": location})
+
+    def auth_header(self):
+        return self.headers.get("Authorization", "")
+
+    def deny(self):
+        time.sleep(0.5)                                   # slows down password guessing
+        self.send(401, "text/plain", b"login required\n",
+                  {"WWW-Authenticate": 'Basic realm="KBUS Manager", charset="UTF-8"'})
+
+    def login_required(self, what):
+        """401 WITHOUT WWW-Authenticate: the page shows its own login dialog."""
+        time.sleep(0.5)
+        self.send_json(401, {"error": f"{what}: log in first"}, {"X-Login": "required"})
+
+    def read_json(self, limit=4096):
+        # JSON only: a cross-site form cannot send it without a CORS preflight (CSRF)
+        if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
+            raise ValueError("Content-Type must be application/json")
+        n = int(self.headers.get("Content-Length", "0") or 0)
+        if n > limit:
+            raise ValueError("too large")
+        d = json.loads(self.rfile.read(n) or b"{}")
+        if not isinstance(d, dict):
+            raise ValueError("JSON object expected")
+        return d
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        # http(s)://<pfc>/kbus (no "/"): the web server passes it on unmapped -> redirect to "/",
+        # which the web server maps back to /kbus/ (proxy map-urlpath also maps Location)
+        if path == WEB_PATH:
+            return self.redirect("/" + self.path[len(WEB_PATH):].lstrip("/"))
+        # old address /mqtt/...: forwarded unmapped -> /kbus/...
+        if OLD_WEB_PATH and (path == OLD_WEB_PATH or path.startswith(OLD_WEB_PATH + "/")):
+            return self.redirect(WEB_PATH + "/" + self.path[len(OLD_WEB_PATH):].lstrip("/"))
+        if path.startswith("/wbm-assets/"):               # look of the page: free (also on the login prompt)
+            name = path[len("/wbm-assets/"):]
+            data = wbm_asset(name) if name in WBM_ASSETS else None
+            if data is None:
+                return self.send(404, "text/plain", b"not found\n")
+            return self.send(200, WBM_ASSETS[name], data, cache=True)
+        if not SETTINGS.check(self.auth_header()):
+            return self.deny()
+        if path == "/clients.json":
+            return self.send_json(200, clients.snapshot())
+        if path == "/api/settings":
+            return self.send_json(200, SETTINGS.public())
+        if path == "/api/login":                          # check user + password (login dialog)
+            if not SETTINGS.verify(self.auth_header()):
+                return self.login_required("login")
+            return self.send_json(200, {"user": SETTINGS.user, "defaultPassword": SETTINGS.default_pw})
+        if path == "/api/info":
+            return self.send_json(200, {"date": time.strftime("%d.%m.%Y"), "time": time.strftime("%H:%M:%S")})
+        if path.startswith("/api/"):
+            return self.send(404, "text/plain", b"not found\n")
         super().do_GET()
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_POST(self):
+        if not SETTINGS.check(self.auth_header()):
+            return self.deny()
+        path = self.path.split("?")[0]
+        if path == "/api/publish":
+            return self.publish()
+        if path == "/api/settings":
+            return self.change_settings()
+        self.send(405, "text/plain", b"use GET\n")
+
+    def publish(self):
+        try:
+            d = self.read_json()
+        except ValueError as e:
+            return self.send_json(400, {"error": str(e)})
+        topic, value = d.get("topic"), d.get("value")
+        if READONLY:
+            return self.send_json(403, {"error": "the manager is read-only (MGMT_READONLY=1)"})
+        rule = None
+        if isinstance(topic, str):
+            rule = next((r for r in WRITABLE if r[0].match(topic)), None)
+        if not rule:
+            return self.send_json(403, {"error": f"topic not writable from this page: {topic}"})
+        if not rule[1](value):
+            return self.send_json(400, {"error": f"invalid value for {topic}: {json.dumps(value)}"})
+        if rule[2] and not SETTINGS.verify(self.auth_header()):
+            return self.login_required("Reset Statistics")
+        full = f"{TOPIC_PREFIX}/{topic}"
+        try:
+            mqtt_publish(full, json.dumps(value))
+        except OSError as e:
+            return self.send_json(502, {"error": f"broker {MQTT_HOST}:{MQTT_PORT} not reachable: {e}"})
+        log.info("%s published %s = %s", self.address_string(), full, json.dumps(value))
+        self.send_json(200, {"topic": full, "value": value})
+
+    def change_settings(self):
+        if not SETTINGS.verify(self.auth_header()):      # else anyone could set a new password
+            return self.login_required("changing the login settings")
+        try:
+            d = self.read_json()
+            err = SETTINGS.update(d.get("login"), d.get("user"), d.get("password"))
+        except ValueError as e:
+            err = str(e)
+        except OSError as e:
+            err = f"cannot store the settings: {e}"
+        if err:
+            return self.send_json(400, {"error": err})
+        log.info("settings changed: login %s", "on, user " + SETTINGS.user if SETTINGS.login else "off")
+        self.send_json(200, SETTINGS.public())
 
     def list_directory(self, path):          # no directory listings
         self.send_error(404)
         return None
 
     def end_headers(self):
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", "max-age=86400" if getattr(self, "_cache", False) else "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
         super().end_headers()
 
     def log_message(self, fmt, *args):       # quiet: only errors
-        if args and str(args[1] if len(args) > 1 else "").startswith(("4", "5")):
+        if len(args) > 1 and str(args[1]).startswith(("4", "5")):
             log.info("%s %s", self.address_string(), fmt % args)
 
 
@@ -160,7 +507,8 @@ clients = Clients()
 def serve():
     srv = http.server.ThreadingHTTPServer((BIND, PORT), Handler)
     srv.daemon_threads = True
-    log.info("monitor page on http://%s:%d/ (%s)", BIND, PORT, WEB_DIR)
+    log.info("KBUS Manager on http://%s:%d/ (%s), writes via %s:%d, prefix %s, %s", BIND, PORT, WEB_DIR,
+             MQTT_HOST, MQTT_PORT, TOPIC_PREFIX, "read-only" if READONLY else "writes allowed")
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
@@ -169,11 +517,16 @@ def serve():
 # Link in the WAGO web server
 # ---------------------------------------------------------------------------
 def lighttpd_conf() -> bytes:
-    p = WEB_PATH
-    return f"""# MQTT monitor (kbus-gateway): http(s)://<pfc>{p}/
-#   {p}/    -> mqtt-manager 127.0.0.1:{PORT} (the page)
+    p, o = WEB_PATH, OLD_WEB_PATH
+    old = f"""    # old address {o}: the mqtt-manager redirects it to {p}/ (forwarded unmapped)
+    $HTTP["url"] =~ "^{o}(/|$)" {{
+        proxy.server = ( "" => (( "host" => "127.0.0.1", "port" => {PORT} )) )
+    }}
+""" if o else ""
+    return f"""# KBUS Manager (kbus-gateway, MQTT): http(s)://<pfc>{p}/
+#   {p}/    -> mqtt-manager 127.0.0.1:{PORT} (the page and its API)
 #   {p}/ws  -> mosquitto    127.0.0.1:{WS_PORT} (MQTT over WebSocket, read only)
-# Written and kept in place by the container mqtt-manager (docker/mqtt-manager, version 2).
+# Written and kept in place by the container mqtt-manager (docker/mqtt-manager, version 3).
 # Remove: docker rm -f mqtt-manager, then
 #   docker run --rm --privileged --pid host --entrypoint python mqtt-manager:<arch> /app/mqtt_manager.py --unlink
 $SERVER["socket"] =~ default_sockets {{
@@ -187,7 +540,7 @@ $SERVER["socket"] =~ default_sockets {{
         proxy.server = ( "" => (( "host" => "127.0.0.1", "port" => {WS_PORT} )) )
         proxy.header = ( "map-urlpath" => ( "{p}/ws" => "/ws" ), "upgrade" => "enable" )
     }}
-}}
+{old}}}
 """.encode()
 
 
@@ -269,12 +622,16 @@ def unlink() -> int:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="MQTT monitor page + link in the WAGO web server")
+    ap = argparse.ArgumentParser(description="KBUS Manager page + link in the WAGO web server")
     ap.add_argument("--unlink", action="store_true", help="remove the link from the web server and exit")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.unlink:
         sys.exit(unlink())
+    global SETTINGS
+    SETTINGS = Settings()
+    log.info("login: %s (from %s)%s", "on, user " + SETTINGS.user if SETTINGS.login else "off", SETTINGS.source,
+             ", DEFAULT password (change it on Settings > Login)" if SETTINGS.default_pw else "")
 
     def on_signal(*_):
         stop.set()

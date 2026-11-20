@@ -1,11 +1,4 @@
-# WebSocket listener (MQTT Monitor page at /mqtt): anonymous clients may read everything and
-# write only the bus settings and the outputs of kbus-gateway. The outputs are only written by the
-# page in its control mode (settings menu); that switch protects against accidental clicks,
-# it is not an access control (port 1883 has no login either). Not writable from the page:
-# kbus/module/+/out/set and every topic outside kbus/.
+# WebSocket listener (KBUS Manager page at /kbus): anonymous clients may only READ.
+# The page writes outputs and bus settings through the mqtt-manager (POST /kbus/api/publish),
+# which checks the login and publishes on port 1883. Port 1883 itself has no login.
 topic read #
-topic write kbus/bus/cycletime/set
-topic write kbus/bus/rescan/set
-topic write kbus/bus/resetstatistics/set
-topic write kbus/do/+/set
-topic write kbus/ao/+/set

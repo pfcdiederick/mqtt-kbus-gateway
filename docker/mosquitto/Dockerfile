@@ -1,6 +1,6 @@
 # kbus-mosquitto: the MQTT broker for the PFC, with its configuration built in.
 #   mosquitto.conf: MQTT on port 1883 (no login), MQTT over WebSocket on 127.0.0.1:9001
-#                   (read only, for the monitor page of the mqtt-manager)
+#                   (read only, for the KBUS Manager page of the mqtt-manager)
 # Build context: this folder.
 #   docker buildx build --platform linux/arm64 -t kbus-mosquitto:arm64 --load docker/mosquitto
 # Run on the controller (tools/deploy-docker.sh --mosquitto does this). The restart policy is a

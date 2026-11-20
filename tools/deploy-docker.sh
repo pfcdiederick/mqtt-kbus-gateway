@@ -6,8 +6,8 @@
 #     (no option)    kbus-gateway container (replaces the native service)
 #     --bridge       also the mqtt-bridge (docker/mqtt-bridge): topics of other brokers -> PFC broker
 #     --mosquitto    also the broker: kbus-mosquitto (docker/mosquitto, configuration built in)
-#     --manager      also the mqtt-manager (docker/mqtt-manager, optional): the monitor page at
-#                    https://<pfc>/mqtt/, linked in the WAGO web server
+#     --manager      also the mqtt-manager (docker/mqtt-manager, optional): the KBUS Manager page at
+#                    http(s)://<pfc>/kbus/, linked in the WAGO web server
 #     --sim          kbus-gateway in simulation mode (KBUS_SIMULATION=1: no real KBUS access,
 #                    e.g. while CODESYS still owns the KBUS)
 #     --no-gateway   leave kbus-gateway as it is (native or container); e.g. only --bridge
@@ -23,10 +23,12 @@
 #   SKIP_BUILD      1 = use the existing archives in build-docker/
 #   GW_ENV          extra docker run arguments for kbus-gateway, e.g. "-e MQTT_TOPIC_PREFIX=line1/kbus"
 #   BR_ENV          extra docker run arguments for the mqtt-bridge
+#   MG_ENV          extra docker run arguments for the mqtt-manager, e.g. "-e MGMT_READONLY=1"
 #
 # Files on the controller (created at the first deployment, then kept):
 #   /home/mqtt-bridge/mqtt-bridge.ini   bridge configuration (+ certificates); docker restart mqtt-bridge
 #   /home/mosquitto/data/                retained values of the broker
+#   /home/mqtt-manager/settings.json     login of the KBUS Manager page
 # The broker configuration is built into the image: docker/mosquitto/mosquitto.conf.
 set -euo pipefail
 
@@ -113,7 +115,7 @@ if [[ $MQ == 1 ]]; then
 set -e
 mkdir -p /home/mosquitto/data
 chown -R 1883:1883 /home/mosquitto/data 2>/dev/null || true
-docker rm -f mosquitto kbus-wbm-link >/dev/null 2>&1 || true   # kbus-wbm-link: replaced by the mqtt-manager
+docker rm -f mosquitto >/dev/null 2>&1 || true
 docker run -d --name mosquitto --restart unless-stopped --network host \
     -v /home/mosquitto/data:/mosquitto/data -v /etc/localtime:/etc/localtime:ro $MQ_IMG >/dev/null
 EOF
@@ -163,10 +165,11 @@ if [[ $BR == 1 ]]; then
 fi
 
 if [[ $MG == 1 ]]; then
-    echo ">>> starting the mqtt-manager (monitor page, /mqtt in the WAGO web server)"
-    $SSH "docker rm -f mqtt-manager >/dev/null 2>&1 || true
+    echo ">>> starting the mqtt-manager (KBUS Manager page, /kbus in the WAGO web server)"
+    $SSH "mkdir -p /home/mqtt-manager && chmod 700 /home/mqtt-manager
+          docker rm -f mqtt-manager >/dev/null 2>&1 || true
           docker run -d --name mqtt-manager --restart unless-stopped --network host --privileged --pid host \
-              -v /etc/localtime:/etc/localtime:ro $MG_IMG >/dev/null"
+              -v /home/mqtt-manager:/data -v /etc/localtime:/etc/localtime:ro ${MG_ENV:-} $MG_IMG >/dev/null"
 fi
 
 echo ">>> 4/4 status"
@@ -176,6 +179,6 @@ $SSH 'sleep 4; docker ps -a --filter name=kbus-gateway --filter name=mqtt-bridge
       grep "kbus-gateway\[" /var/log/messages | tail -8'
 [[ $BR == 1 ]] && echo ">>> bridge: ssh $PFC_USER@$PFC docker logs -f mqtt-bridge  (configuration: /home/mqtt-bridge/mqtt-bridge.ini)"
 echo ">>> topics: mosquitto_sub -h $PFC -t 'kbus/#' -t 'bridge/#' -v"
-[[ $MG == 1 ]] && echo ">>> monitor: https://$PFC/mqtt/  (log: ssh $PFC_USER@$PFC docker logs mqtt-manager)"
+[[ $MG == 1 ]] && echo ">>> KBUS Manager: http://$PFC/kbus  (log: ssh $PFC_USER@$PFC docker logs mqtt-manager)"
 [[ $GW == 1 ]] && echo ">>> done. Back to the native service: $0 $PFC --native"
 exit 0
