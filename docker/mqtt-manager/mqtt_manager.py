@@ -14,7 +14,7 @@ Jobs:
 1. Serve the page (web/: index.html, kbus.js, kbus.css) and its API on MANAGER_BIND:MANAGER_PORT:
      /api/settings   GET: login settings, topic prefix, read-only; POST JSON {login, user, password} (login)
      /api/login      GET with Authorization: check user + password (login dialog)
-     /api/publish    POST JSON {topic, value}: write an output or a bus setting
+     /api/publish    POST JSON {topic, value}: write an output or a bus setting, or send bytes on COM1
      /api/info       date and time of the controller (status bar)
      /wbm-assets/... fonts, logo and favicon of the controller's own WBM (look of the page)
 2. Link /kbus in the WAGO web server and keep it linked: write
@@ -217,8 +217,10 @@ def _mqtt_packet(head: int, body: bytes) -> bytes:
             return bytes([head]) + bytes(rl) + body
 
 
-def mqtt_publish(topic: str, payload: str):
-    """Publish one message on the broker; raises OSError on failure."""
+def mqtt_publish(topic: str, payload):
+    """Publish one message (payload: str = UTF-8 text, bytes = as is); raises OSError on failure."""
+    if isinstance(payload, str):
+        payload = payload.encode()
     flags, extra = 0x02, b""                                      # clean session
     if MQTT_USER:
         flags |= 0x80
@@ -238,21 +240,31 @@ def mqtt_publish(topic: str, payload: str):
             ack += chunk
         if ack[0] != 0x20 or ack[3] != 0:
             raise OSError(f"broker refused the connection (code {ack[3]})")
-        s.sendall(_mqtt_packet(0x30, _mqtt_str(topic.encode()) + payload.encode()))
+        s.sendall(_mqtt_packet(0x30, _mqtt_str(topic.encode()) + payload))
         s.sendall(b"\xe0\x00")                                    # DISCONNECT
 
 
-# topics the page may write (relative to the prefix) and the check of the value
+# topics the page may write (relative to the prefix): (pattern, check of the value, needs the
+# login, payload); payload None = the value as JSON (true, 1234), else a function value -> bytes
 def _bool(v):
     return v in (True, False)
 
 
+def _com1_bytes(v):
+    """COM1 test send: a string of 1..512 characters U+0000..U+00FF, one character per byte."""
+    return isinstance(v, str) and 1 <= len(v) <= 512 and all(ord(c) <= 0xFF for c in v)
+
+
 WRITABLE = [
-    (re.compile(r"^do/[1-9][0-9]{0,2}/set$"), _bool, False),
-    (re.compile(r"^ao/[1-9][0-9]{0,2}/set$"), lambda v: isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 65535, False),
+    # outputs: only when logged in (the page offers them only under "Take Control")
+    (re.compile(r"^do/[1-9][0-9]{0,2}/set$"), _bool, True),
+    (re.compile(r"^ao/[1-9][0-9]{0,2}/set$"), lambda v: isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 65535, True),
     (re.compile(r"^bus/cycletime/set$"), lambda v: isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 40, False),
     (re.compile(r"^bus/rescan/set$"), lambda v: v is True, False),
     (re.compile(r"^bus/resetstatistics/set$"), lambda v: v is True, True),      # needs the login
+    # COM1 test send: the bytes as they are (binary), not JSON. The COM1 settings are NOT
+    # writable here: they are set by the client (CODESYS).
+    (re.compile(r"^serial/com1/tx/set$"), _com1_bytes, False, lambda v: v.encode("latin-1")),
 ]
 
 
@@ -405,10 +417,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if not rule[1](value):
             return self.send_json(400, {"error": f"invalid value for {topic}: {json.dumps(value)}"})
         if rule[2] and not SETTINGS.verify(self.auth_header()):
-            return self.login_required("Reset Statistics")
+            return self.login_required("writing outputs" if topic[:3] in ("do/", "ao/") else "Reset Statistics")
         full = f"{TOPIC_PREFIX}/{topic}"
+        payload = rule[3](value) if len(rule) > 3 else json.dumps(value)
         try:
-            mqtt_publish(full, json.dumps(value))
+            mqtt_publish(full, payload)
         except OSError as e:
             return self.send_json(502, {"error": f"broker {MQTT_HOST}:{MQTT_PORT} not reachable: {e}"})
         log.info("%s published %s = %s", self.address_string(), full, json.dumps(value))

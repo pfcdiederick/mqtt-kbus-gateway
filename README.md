@@ -3,7 +3,8 @@
 A small native program for WAGO PFC100 / PFC200 / **PFC300** controllers that
 **owns the KBUS** and makes all of its data available on an **MQTT broker**
 (mosquitto on the controller): every DI / DO / AI / AO channel, the module list
-and the bus status. Outputs are switched by publishing to a `.../set` topic. It
+and the bus status. Outputs are switched by publishing to a `.../set` topic. The
+serial interface **COM1** is forwarded transparently over MQTT as well (3.9). It
 is installed as a firmware package (`.ipk`), or runs as a container, starts at
 boot and runs the KBUS cycle every **5 ms** with real-time priority.
 
@@ -13,8 +14,8 @@ Around it, each in its own container:
 - **mqtt-bridge**: subscribes to topics on **other MQTT brokers** and publishes
   them on the broker of the PFC, so data from elsewhere sits next to the KBUS data;
 - **mqtt-manager** (optional): the **KBUS Manager** page at
-  `http(s)://<pfc-ip>/kbus`, in the look of the WBM: status, modules, live
-  I/O with switching, topics, clients, cycle time, login.
+  `http(s)://<pfc-ip>/kbus`, in the look of the WBM: status, modules, COM1,
+  all topics live with switching of the outputs, clients, cycle time, login.
 
 ```
                                     WAGO PFC300
@@ -34,6 +35,7 @@ Around it, each in its own container:
 mosquitto_sub -h 127.0.0.1 -t 'kbus/#' -v              # everything (on the controller)
 mosquitto_pub -h 127.0.0.1 -t kbus/do/3/set -m true     # switch DO3 on
 mosquitto_pub -h 127.0.0.1 -t kbus/ao/1/set -m 16384    # AO1 to half scale (raw)
+mosquitto_pub -h 127.0.0.1 -t kbus/serial/com1/tx/set -m 'hello'   # send bytes on COM1
 ```
 
 The KBUS access is based on the WAGO example *HowTo_ADI-MyKBusApplikation* in
@@ -51,7 +53,7 @@ replaced by MQTT (see [6](#6-how-it-was-built)).
 
 1. [How it works](#1-how-it-works)
 2. [Installation](#2-installation)
-3. [MQTT topics](#3-mqtt-topics) (3.7: the KBUS Manager page, 3.8: 750-495)
+3. [MQTT topics](#3-mqtt-topics) (3.7: the KBUS Manager page, 3.8: 750-495, 3.9: COM1, 3.10: module values, 3.11: write watchdog, 3.12: 750-671 stepper)
 4. [mqtt-bridge: topics from other brokers](#4-mqtt-bridge-topics-from-other-brokers)
 5. [Configuration](#5-configuration)
 6. [How it was built](#6-how-it-was-built)
@@ -288,6 +290,15 @@ tests/test-mqtt.py 192.168.1.17 write --do 1      # real node: switches DO1 on/o
 #   --port 1884 --user scada --password ...       for a listener with login
 ```
 
+On the PC, without a PFC (a local broker, e.g. `mosquitto -p 18830`; `make` first):
+
+```bash
+make run-sim                                                  # simulated node; then, in another terminal:
+tests/test-mqtt.py 127.0.0.1 sim                              # every KBUS topic and command
+tests/test-mqtt.py 127.0.0.1 serial --gateway build/kbus-gateway   # COM1 on a virtual serial port (pty);
+                                                              # starts the gateway itself, run-sim not needed
+```
+
 ### 2.8 Alternative: kbus-gateway as a Docker container
 
 The same program also runs as a container ([docker/gateway](docker/gateway);
@@ -304,8 +315,8 @@ The script stops the native service and removes its boot link while the
 container runs. The container uses `--privileged --network host` (real-time
 priority, KBUS hardware, broker on `127.0.0.1`), mounts the firmware's
 `/usr/lib` (read-only; the entrypoint loads the WAGO libraries without the
-firmware's glibc), `/var/run/dbus`, `/etc/specific`, the KBUS devices and
-`/home/kbus-gateway`. It does **not** read `/etc/kbus-gateway.conf`: other settings
+firmware's glibc), `/var/run/dbus`, `/etc/specific`, the KBUS devices, the
+serial interface `/dev/serial` (COM1, 3.9) and `/home/kbus-gateway`. It does **not** read `/etc/kbus-gateway.conf`: other settings
 with `GW_ENV`, e.g. `GW_ENV="-e MQTT_TOPIC_PREFIX=line1/kbus" tools/deploy-docker.sh ...`.
 
 ---
@@ -326,10 +337,20 @@ kbus/ao/<n>                     0..65535                analog output n (the val
 kbus/<class>/all                [..]                    the whole class as JSON array (MQTT_ARRAYS=1)
 kbus/modules                    [{..}]                  modules and their channels (JSON, 3.4)
 kbus/module/<pos>/in            24 bytes (binary)       raw input data of a complex module, e.g. 750-495 (3.8)
+kbus/module/<pos>/temperature/<n>  21.4                 scaled value of a module with a descriptor, e.g. 750-450 in °C (3.10)
+kbus/watchdog                   ok | expired            write watchdog, only with MQTT_WATCHDOG_S (3.11)
+kbus/module/<pos>/stepper/state     {..}                 750-671 state (3.12)
+kbus/module/<pos>/stepper/response  {..}                 result of a stepper command, not retained
 kbus/bus/healthy                true | false            KBUS cycle running without errors
 kbus/bus/cycletime              1..40                   ms
 kbus/bus/configversion          1, 2, ...               +1 for every bus scan: modules/channels changed
 kbus/bus/statistics             {..}                    every MQTT_STATS_S (3.4)
+kbus/serial/com1/open           true | false            COM1 device open (3.9)
+kbus/serial/com1/baudrate       19200                   current COM1 settings
+kbus/serial/com1/format         8E1
+kbus/serial/com1/framegap       10                      ms
+kbus/serial/com1/statistics     {..}                    bytes, frames, dropped frames, line errors
+kbus/serial/com1/rx             bytes (binary)          ONE message per received frame, not retained
 kbus/error                      {"topic":..,"error":..} a rejected command (not retained)
 
 write (publish WITHOUT retain):
@@ -341,6 +362,12 @@ kbus/bus/cycletime/set          1..40                   stored, survives a resta
 kbus/bus/rescan/set             true                    rescan the KBUS now
 kbus/bus/resetstatistics/set    true                    cycles, errors, max values and overruns back to 0
 kbus/module/<pos>/out/set       24 bytes (binary)       raw output data of a complex module (3.8)
+kbus/watchdog/set               any                     heartbeat of the controlling side (3.11)
+kbus/module/<pos>/stepper/cmd/set   {"cmd":..}          750-671 command: enable, move, reference, stop, quit, disable (3.12)
+kbus/serial/com1/tx/set         1..512 bytes (binary)   send on COM1 as they are (3.9)
+kbus/serial/com1/baudrate/set   9600                    COM1 settings: stored, survive a restart
+kbus/serial/com1/format/set     8N1
+kbus/serial/com1/framegap/set   20
 ```
 
 Channels are numbered per class from 1, in KBUS order (left to right), as in
@@ -437,10 +464,19 @@ c.loop_forever()
 
 ### 3.6 Retained topics after changes
 
-At every connection kbus-gateway reads the retained channel topics that are on
-the broker and deletes those of channels that do not exist (e.g. `kbus/di/20`
-from a module that was removed while the program was stopped). The same
-happens after a rescan. So the broker always shows exactly the current node.
+At every connection kbus-gateway reads the retained topics that are on the
+broker and deletes those that do not belong to the current node: channel
+topics (e.g. `kbus/di/20` from a module that was removed while the program was
+stopped) and module topics (`kbus/module/<pos>/in`, `.../temperature/<n>`,
+`.../stepper/state` of a module that is gone or is another type now). The
+same happens after a rescan. So the broker always shows exactly the current
+node, and so does the KBUS Manager page: it builds its I/O, module values and
+stepper panels from these topics.
+
+The node is scanned at every start and again by itself when it changes: after
+0.5 s of failing bus cycles kbus-gateway rescans the KBUS (or on
+`kbus/bus/rescan/set`). WAGO allows changing modules only with the node
+switched off, so in practice the new node is found at the next start.
 
 ### 3.7 KBUS Manager page (mqtt-manager)
 
@@ -452,12 +488,12 @@ panels, status bar with LEDs, the WBM's own fonts and logo, a link to the WBM
 
 | Tab | Page | Content |
 |---|---|---|
-| Status | KBUS Status | state, kbus-gateway online/offline, cycle time, cycles, errors, configuration version, version; timing (exchange, max. exchange, max. wake-up delay, overruns, real-time); *Reset Statistics* (login), *Rescan KBUS* |
+| Status | COM1 | communication parameters (state, baud rate, format, frame gap), **read only**: they are set by the client; monitor: bytes, frames, dropped, errors, the last 10 received frames, test send (3.9) |
+| | KBUS | state, kbus-gateway online/offline, cycle time, cycles, errors, configuration version, version, write watchdog; timing (exchange, max. exchange, max. wake-up delay, overruns, real-time); *Reset Statistics* (login), *Rescan KBUS* |
 | | Modules | `kbus/modules`: position, name, type code, channels |
-| I/O | Process Image | DI lamps, DO lamps + ON/OFF buttons, AI/AO bars, AO input + *Set* |
-| MQTT | Topics | every topic received (`kbus/#`, `bridge/status`, `bridge/+/status`) with value and time, filter |
+| MQTT | Topics | every topic received (`kbus/#`, `bridge/status`, `bridge/+/status`) with value and time, filter. All DI/DO/AI/AO, the 750-450 temperatures and the 750-671 state are in this list. **Changing outputs**: log in, *Take Control*, click the value of `kbus/do/<n>` (`true`/`false`) or `kbus/ao/<n>` (0–65535), type, Enter (Esc = cancel). Control is **temporary**: on *Release Control*, logout or closing the page, every output written under control goes back to `false` / `0`. Command topics (`…/set`) are not listed |
 | | Clients | MQTT clients connected to the broker (from mosquitto's connection log; a client from 127.0.0.1 is shown as CODESYS), state of the mqtt-bridge and its remote brokers |
-| Settings | KBUS Cycle | `kbus/bus/cycletime/set`, 1–40 ms |
+| Settings | KBUS | `kbus/bus/cycletime/set`, 1–40 ms |
 | | Login | website login on/off, user, password |
 
 Status bar LEDs: **KBUS** (running / error), **GW** (`kbus/status`), **MQTT**
@@ -473,12 +509,14 @@ Status bar LEDs: **KBUS** (running / error), **GW** (`kbus/status`), **MQTT**
 - **Reads** are live over MQTT/WebSocket (no polling). The WebSocket listener
   of the broker is read only (`docker/mosquitto/acl-monitor`).
 - **Writes** go through the mqtt-manager, which checks them and publishes on
-  port 1883: `do/<n>/set`, `ao/<n>/set`, `bus/cycletime/set`,
-  `bus/rescan/set`, `bus/resetstatistics/set`; nothing else (no raw module
-  data, nothing outside the prefix).
+  port 1883 (`do`/`ao` only with the login): `do/<n>/set`, `ao/<n>/set`, `bus/cycletime/set`,
+  `bus/rescan/set`, `bus/resetstatistics/set`, `serial/com1/tx/set` (test
+  send, as bytes); nothing else (no raw module data, no COM1 settings,
+  nothing outside the prefix).
 - **Login** (same rules as the wdx KBUS Manager): the website is open by
-  default; *Login required* on Settings > Login closes it. *Reset Statistics*
-  and changing the login settings **always** need the login (gear button, top
+  default; *Login required* on Settings > Login closes it. Writing outputs
+  (*Take Control*), *Reset Statistics* and changing the login settings
+  **always** need the login (gear button, top
   right): default `admin` / `wago` until a password is set. Stored in
   `/home/mqtt-manager/settings.json` on the controller (password as PBKDF2
   hash). The login protects the page; port 1883 of the broker has no login,
@@ -524,7 +562,7 @@ interfaces) get their **raw process data** as binary messages:
 
 | Topic | Direction | Content |
 |---|---|---|
-| `kbus/module/<pos>/in` | kbus-gateway → | the module's input bytes (750-495: 24), all from one bus cycle, only when they change |
+| `kbus/module/<pos>/in` | kbus-gateway → | the module's input bytes (750-495: 24), all from one bus cycle, when they change, at most once per `MQTT_RAW_MIN_MS` (100 ms) per module; after a suppressed change the latest bytes always follow |
 | `kbus/module/<pos>/out/set` | → kbus-gateway | exactly the module's output bytes (750-495: 24), written in one piece for the next bus cycle; without retain |
 
 `kbus/modules` shows them as `"raw":{"in":24,"out":24}`. kbus-gateway does
@@ -634,6 +672,144 @@ time-out for the module's answer, set it to at least 500 ms.
 mosquitto_sub -h <pfc-ip> -t kbus/module/2/in -F "%U %x"     # time + 24 bytes in hex
 ```
 
+### 3.9 Serial interface COM1
+
+kbus-gateway also owns the serial interface **COM1** of the controller
+(`/dev/serial`) and forwards it **transparently**: it does not interpret the
+bytes. The protocol of the connected device (Modbus RTU, a barcode reader, a
+meter, ...) is implemented in the client, e.g. CODESYS. The same function as
+`Serial/Com1/...` of the HTTP/wdx gateway, on MQTT.
+
+| Topic | Direction | Content |
+|---|---|---|
+| `kbus/serial/com1/rx` | kbus-gateway → | **one message per received frame**, binary, not retained |
+| `kbus/serial/com1/tx/set` | → kbus-gateway | 1–512 bytes, sent as they are (binary); without retain |
+| `kbus/serial/com1/open` | kbus-gateway → | `true` / `false`: device open (retained) |
+| `kbus/serial/com1/baudrate`, `format`, `framegap` | kbus-gateway → | the current settings (retained) |
+| `kbus/serial/com1/baudrate/set`, `format/set`, `framegap/set` | → kbus-gateway | new settings, applied at once, stored in `KBUS_SETTINGS_STORE`; without retain |
+| `kbus/serial/com1/statistics` | kbus-gateway → | `{"txBytes":..,"rxBytes":..,"frames":..,"dropped":..,"errors":..}`, retained, when it changes (at most once per second) |
+
+- **Frames.** A pause of `framegap` ms (default 10) after the last received
+  byte ends a frame. Choose it larger than the gaps *inside* a frame of the
+  device and smaller than the pause between two frames (Modbus RTU: 3.5
+  characters, i.e. 4 ms at 9600 baud; 10 ms is safe up to 9600 baud). A frame
+  longer than 512 bytes is split.
+- **Latency.** Frames go into a queue of 64; the MQTT thread publishes all of
+  them at every tick (`MQTT_PUBLISH_MS`, 20 ms). A frame reaches the broker
+  about framegap + ≤ 20 ms after its last byte; none is lost between two
+  ticks. When the queue is full (no broker connection), the oldest frame is
+  dropped and counted in `dropped`. Frames received while there is no broker
+  connection are discarded at the reconnect: they are old.
+- **Settings are made on the client side**: the client publishes
+  `baudrate/set` (1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400),
+  `format/set` (data bits 5–8, parity `N`/`E`/`O`, stop bits 1/2, e.g. `8E1`)
+  and `framegap/set` (1–1000 ms), preferably only when they differ from the
+  retained current values. A value written there wins over `SERIAL_BAUD`,
+  `SERIAL_FORMAT`, `SERIAL_FRAME_GAP_MS` and survives a restart. Invalid values
+  are answered on `kbus/error` and change nothing. The KBUS Manager page only
+  shows them (*Status > COM1*).
+- **RS-232 / RS-485** is chosen in the WBM (*Interfaces > Serial Interface*);
+  the owner of the interface must be **None**, so that kbus-gateway can open
+  it (it opens it exclusively). The RS-485 direction is switched by the driver.
+- **Off**: `SERIAL_DEVICE=""` (and in simulation unless it is set): no
+  serial topics; retained ones of an earlier run are deleted. With
+  `MQTT_WRITE_ENABLE=0` no serial `/set` topics are subscribed.
+
+```bash
+mosquitto_sub -h <pfc-ip> -t 'kbus/serial/com1/#' -v                     # settings, statistics, frames
+mosquitto_sub -h <pfc-ip> -t kbus/serial/com1/rx -F "%U %x"              # frames in hex with a time stamp
+printf '\x01\x03\x00\x00\x00\x02\xc4\x0b' | mosquitto_pub -h <pfc-ip> -t kbus/serial/com1/tx/set -s   # binary
+mosquitto_pub -h <pfc-ip> -t kbus/serial/com1/baudrate/set -m 9600
+```
+
+### 3.10 Module values (module descriptors)
+
+Some module types get **functional values** next to their raw channels: one
+descriptor per module type (`src/modules.c`) says which channels mean what,
+in which unit and with which resolution. The topics are the same for every
+type:
+
+```
+kbus/module/<pos>/<function>/<n>    value in the unit of the descriptor (retained, on change)
+```
+
+| Module | Function | Value | Raw channels |
+|---|---|---|---|
+| 750-450 (4 RTD inputs) | `temperature/1..4` | °C, signed, 0.1 °C per digit (Pt100: −200.0 … 850.0) | stay as `kbus/ai/<n>` (raw, unsigned) |
+
+- `kbus/modules` lists the descriptor: `"functions":{"temperature":{"unit":"°C","resolution":0.1}}`.
+- The 750-450 is set to its sensor type with WAGO-I/O-CHECK. For a setting
+  with another resolution or unit (e.g. resistance), set
+  `MODULE_450_RESOLUTION` and `MODULE_450_UNIT`.
+- `MQTT_ANALOG_DEADBAND` applies in digits (e.g. `2` = 0.2 °C).
+- The **750-671** has a driver of its own (3.12).
+- Not yet: the **750-657** (IO-Link master). Its handshakes (mailbox,
+  control/status byte) have to run in the gateway, not in an MQTT client: raw
+  bytes over MQTT would break them through broker latency. Until its driver
+  exists it only gets its raw bytes (`kbus/module/<pos>/in`, `out/set`, 3.8).
+  Planned: port data and port status as state, IO-Link parameters as
+  request/response with a request ID.
+
+### 3.11 Write watchdog
+
+With `MQTT_WATCHDOG_S=N` kbus-gateway supervises the controlling side (e.g.
+CODESYS): when it has received **no write and no `kbus/watchdog/set` for N
+seconds**, it switches **all outputs to 0**: every DO and AO, and the raw
+output bytes of complex modules (750-495, and the control bytes of a
+750-657 / 750-671, which stops a stepper). This is the safe state for the
+case that the client, its network or the broker disappears.
+
+- The watchdog starts with the first write or heartbeat (outputs are 0 after
+  the start anyway). Publish `kbus/watchdog/set` (any payload, **without**
+  retain) at least every N/2 s when the outputs do not change that often.
+- `kbus/watchdog` (retained): `ok`, or `expired` after it switched the
+  outputs off. The next write or heartbeat sets it back to `ok`; outputs are
+  not restored, the client writes them again.
+- Also kbus-gateway's own failure is covered: `kbus/status` = `offline` (last
+  will), and the output modules switch off by themselves 50 ms after the KBUS
+  cycle stops.
+
+### 3.12 750-671 stepper controller
+
+kbus-gateway runs the **handshake of the 750-671** itself (positioning
+application, `Application_Selector = 1`, cyclic process image; manual
+750-671, 2.1.2.7 and 2.1.2.11.1), at every tick (`MQTT_PUBLISH_MS`, 20 ms).
+MQTT carries only commands and results, so broker latency cannot break the
+handshake. There is no closed-loop control over MQTT: the module ramps and
+positions itself; MQTT starts and monitors it.
+
+| Topic | Direction | Content |
+|---|---|---|
+| `kbus/module/<pos>/stepper/cmd/set` | → kbus-gateway | JSON command, without retain; optional `"id"` (echoed in the response) |
+| `kbus/module/<pos>/stepper/response` | kbus-gateway → | `{"cmd":..,"id":..,"result":"accepted"\|"done"\|"error","error":..}`, not retained |
+| `kbus/module/<pos>/stepper/state` | kbus-gateway → | retained; flags on change, position/velocity at most every 100 ms |
+
+| Command | What the driver does | Response |
+|---|---|---|
+| `{"cmd":"enable"}` | Enable + Stop2_N, acknowledges a module reset (Reset_Quit) | `done` when Ready and Stop_N_ACK; `error` e.g. "Input1 (stop circuit) is open" |
+| `{"cmd":"move","position":P,"velocity":V,"acceleration":A}` | absolute position (24-bit, steps or the configured unit), V 1–25000, A 1–32767; selects the positioning mode, setpoints, Start edge | `accepted` at Start_ACK, `done` at On_Target. A new `move` during a move changes the target on the fly |
+| `{"cmd":"reference","direction":"neg"\|"pos"}` | reference run at the setup speed (Reference_Mode from the module configuration) | `done` at Reference_OK |
+| `{"cmd":"stop"}` | ends the mode: the module brakes with Acceleration_Stop_Fast | `done` at standstill |
+| `{"cmd":"quit"}` | Error_Quit + Reset_Quit | `done` / `error` "error still present" |
+| `{"cmd":"disable"}` | Enable off; refused while the drive moves (Enable 0 stops without a ramp) | `done` when Ready is off |
+
+```
+kbus/module/4/stepper/state = {"enabled":true,"ready":true,"stopAck":true,"mode":"positioning",
+  "busy":false,"onTarget":true,"standstill":true,"referenced":true,"error":false,"reset":false,
+  "input1":true,"input2":false,"position":2000,"velocity":0,"command":null}
+```
+
+- Invalid commands are answered on `kbus/error` and change nothing; a
+  command that fails at the module gets `result: "error"` with the reason.
+- **Safe state** (write watchdog, 3.11): a **controlled stop** (mode and
+  Start off, braking ramp); Enable stays on, so the motor keeps its holding
+  current. The running command ends with `error`.
+- The raw output bytes belong to the driver: `kbus/module/<pos>/out/set` is
+  refused; `kbus/module/<pos>/in` is still published (diagnosis).
+- **Input1** (DI1) is the module's stop circuit in the default configuration:
+  open = no start possible. Jog mode, move programs, the mailbox
+  (configuration tables) and the velocity application are not supported.
+
 ---
 
 ## 4. mqtt-bridge: topics from other brokers
@@ -723,10 +899,17 @@ with `/etc/init.d/kbus-gateway restart`):
 | `MQTT_REPUBLISH_S` | `0` | publish all values again every N s (for clients that need a heartbeat), 0 = only changes |
 | `MQTT_WRITE_ENABLE` | `1` | `0` = read only: no `/set` topics |
 | `MQTT_LOG` | `1` | 0 none, 1 writes that change an output and bus commands, 2 every received message |
+| `MQTT_RAW_MIN_MS` | `100` | `kbus/module/<pos>/in` at most once per N ms per module (e.g. a 750-657 whose input bytes change every cycle: 37 → 10 messages/s); the latest bytes always follow; 0 = every change |
+| `MQTT_WATCHDOG_S` | `0` | write watchdog (3.11): no write and no `watchdog/set` for N s → all outputs 0; 0 = off |
+| `MODULE_450_RESOLUTION`, `MODULE_450_UNIT` | `0.1`, `°C` | 750-450 value per digit and unit (3.10), for other sensor settings |
 | `MQTT_PRIORITY` | `0` (package: `30`) | SCHED_FIFO priority of the MQTT thread, 0 = normal. Keep it **below** `KBUS_PRIORITY` |
 | `KBUS_CYCLE_MS` | `5` | KBUS cycle, 1–40 ms (well below the 50 ms output watchdog). A value written to `bus/cycletime/set` wins and is kept in `KBUS_SETTINGS_STORE` |
-| `KBUS_SETTINGS_STORE` | `/home/kbus-gateway/kbus-settings.conf` | delete the file to use `KBUS_CYCLE_MS` again; empty = not stored |
+| `KBUS_SETTINGS_STORE` | `/home/kbus-gateway/kbus-settings.conf` | cycle time and COM1 settings written over MQTT; delete the file to use `KBUS_CYCLE_MS` / `SERIAL_*` again; empty = not stored |
 | `KBUS_PRIORITY` | `40` | SCHED_FIFO priority of the KBUS cycle thread, 0 = normal |
+| `SERIAL_DEVICE` | `/dev/serial` (simulation: `""`) | COM1 device (3.9); `""` = COM1 off. Set explicitly, it is also used in simulation (e.g. a pty for tests) |
+| `SERIAL_BAUD` | `19200` | 1200 … 230400 (standard rates). A value written to `serial/com1/baudrate/set` wins and is kept in `KBUS_SETTINGS_STORE` |
+| `SERIAL_FORMAT` | `8E1` | data bits 5–8, parity N/E/O, stop bits 1/2; `format/set` wins |
+| `SERIAL_FRAME_GAP_MS` | `10` | 1–1000: a pause this long ends a received frame; `framegap/set` wins |
 | `LOG_TARGET` | stderr (package: `syslog`) | `syslog` = `/var/log/messages` |
 | `KBUS_SIMULATION` | `0` | `1` = simulated node, no hardware (development) |
 | `KBUS_SIM_HOTPLUG` | – | simulation only: while this file exists, a 6th module (8DI) is "plugged in" |
@@ -801,10 +984,13 @@ inheritance.
 | `src/main.c` | startup order, signals, memory locking |
 | `src/config.c/.h` | environment variables → `gw_config_t` |
 | `src/backend_adi.c` | real KBUS: `dlopen` of `libdal`, ADI device scan, KBUS-info, cycle |
-| `src/backend_sim.c` | simulated node (12 DI, 8 DO, 4 AI, 4 AO; DI1–8 follow DO1–8, AI4 follows AO1) |
+| `src/backend_sim.c` | simulated node (12 DI, 8 DO, 8 AI, 4 AO; DI1–8 follow DO1–8, AI4 follows AO1; a 750-450 with AI5–8, AI8 follows AO2; a model of the 750-671 positioning handshake) |
+| `src/modules.c/.h` | module descriptors: functional values of a module type (750-450 temperatures) |
+| `src/stepper.c/.h` | 750-671 driver: positioning handshake, commands, state, controlled stop |
 | `src/gateway.c/.h` | channel map, process images, real-time cycle thread, rescans, bulk read/write under one lock |
 | `src/mqtt_client.c/.h` | MQTT 3.1.1 client: connect with last will, QoS 0 publish (buffered), subscribe, keep-alive |
 | `src/mqtt_io.c/.h` | topic tree, change detection, `/set` commands, stale topic cleanup, reconnects |
+| `src/serial.c/.h` | COM1: open, settings (termios), receive thread with frame gap and frame queue, transmit |
 | `src/log.c/.h` | stderr or syslog |
 
 ---
@@ -902,6 +1088,9 @@ section 3.
 | `version 'GLIBC_2.xx' not found` | built with a newer toolchain than the firmware: use the SDK builder image |
 | Channel numbers point to the wrong I/O | compare the startup module list with the node; try `KBUS_DIGITAL_OFFSET_MODE=relative` or `absolute` |
 | New modules not visible | look for `KBUS rescan` in the log; `kbus/bus/rescan/set` = `true` |
+| `COM1: cannot open /dev/serial` / `serial/com1/open` = `false` | the serial interface has another owner in the WBM (*Interfaces > Serial Interface*: set **None**), another program uses it, or the container has no `/dev/serial` (deploy again) |
+| COM1: frames split in two, or two frames in one `rx` message | `framegap` too small / too large for the device (3.9) |
+| COM1: `dropped` increasing | the broker connection was away, or the frames come faster than they can be published |
 | mqtt-bridge: `[name] ... refused the connection` / TLS errors | login, `ca_file`, port 8883 vs 1883; `log_level = DEBUG` shows every message |
 
 ---
@@ -937,5 +1126,12 @@ section 3.
   PFC100/PFC200 neither. Only digital outputs were tested on real hardware;
   inputs and analog modules only with the simulation node. The 750-495 gets
   no channels (its measured values are not available).
+- On the test node (PFC300 FW30 with 8DO, 750-657, 750-450, 750-671): the
+  750-450 temperatures, the write watchdog on a real DO, and the 750-671
+  state are tested. The 750-671 commands (enable, move, reference) are tested
+  against the simulation model only, not yet with a motor. The 750-657 has no
+  driver yet (3.10).
+- COM1 is tested with a virtual serial port (pty) on the PC, not yet on the
+  controller's own interface (RS-232 / RS-485).
 - On `stop` and `opkg remove` all outputs are switched to 0. If the program
   crashes, the output modules switch off on their own after 50 ms.

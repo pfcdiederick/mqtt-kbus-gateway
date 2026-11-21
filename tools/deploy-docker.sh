@@ -135,7 +135,7 @@ done
 docker rm -f kbus-gateway kbus-mqtt >/dev/null 2>&1 || true   # kbus-mqtt: name of 1.0.0
 mkdir -p /home/kbus-gateway
 OPT=""
-for f in /etc/config-tools/get_typelabel_value:ro /dev/eeprom: /dev/ttyKbus: /dev/log: /etc/localtime:ro; do
+for f in /etc/config-tools/get_typelabel_value:ro /dev/eeprom: /dev/ttyKbus: /dev/serial: /dev/log: /etc/localtime:ro; do
     p=\${f%%:*}; ro=\${f#*:}; [ -n "\$ro" ] && ro=":\$ro"
     if [ -e "\$p" ]; then OPT="\$OPT -v \$p:\$p\$ro"; else echo "note: \$p not present, not mounted"; fi
 done

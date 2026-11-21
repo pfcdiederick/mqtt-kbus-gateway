@@ -36,9 +36,9 @@
     <div class="sub-content">
       <p id="msg"></p>
 
-      <!-- Status / KBUS Status -->
+      <!-- Status / KBUS -->
       <div class="wbm-page" id="page-status-kbus">
-        <h2 class="page">KBUS Status</h2>
+        <h2 class="page">KBUS</h2>
         <div class="form collapsible"><span class="title">KBUS</span><div class="body">
           <div class="field"><label>State</label><div class="control" id="st-healthy">–</div></div>
           <div class="field"><label>kbus-gateway</label><div class="control" id="st-gateway">–</div></div>
@@ -47,6 +47,8 @@
           <div class="field"><label>Errors</label><div class="control value" id="st-errors">–</div></div>
           <div class="field"><label>Configuration Version</label><div class="control value" id="st-configversion">–</div></div>
           <div class="field"><label>Version</label><div class="control value" id="st-version">–</div></div>
+          <div class="field"><label>Write Watchdog</label><div class="control" id="st-watchdog"
+            title="MQTT_WATCHDOG_S: without a write or kbus/watchdog/set for that long, all outputs go to 0">–</div></div>
           <div class="buttons"><button class="w auth-only" id="reset" title="Cycles, errors, maximum values and overruns back to 0">Reset Statistics</button> <button class="w assertive" id="rescan">Rescan KBUS</button></div>
         </div></div>
         <div class="form collapsible"><span class="title">Timing</span><div class="body">
@@ -67,26 +69,48 @@
         </div></div>
       </div>
 
-      <!-- I/O / Process Image -->
-      <div class="wbm-page" id="page-io-process">
-        <h2 class="page">Process Image</h2>
-        <p class="note">Live values of all KBUS channels. Outputs are switched at once (<code>kbus/do/&lt;n&gt;/set</code>);
-          another program that writes the same outputs cyclically (e.g. CODESYS) overwrites them in its next cycle.</p>
-        <div class="form wide"><span class="title">Digital Inputs</span><div class="body"><div class="io-grid" id="io-di"></div></div></div>
-        <div class="form wide"><span class="title">Digital Outputs</span><div class="body"><div class="io-grid" id="io-do"></div></div></div>
-        <div class="form wide"><span class="title">Analog Inputs (raw 0–65535)</span><div class="body"><div class="analog" id="io-ai"></div></div></div>
-        <div class="form wide"><span class="title">Analog Outputs (raw 0–65535)</span><div class="body"><div class="analog" id="io-ao"></div></div></div>
+      <!-- Status / COM1 -->
+      <div class="wbm-page" id="page-status-serial">
+        <h2 class="page">COM1</h2>
+        <p class="note">The gateway forwards COM1 transparently over MQTT (<code>kbus/serial/com1/...</code>): every received
+          frame is one <code>rx</code> message, <code>tx/set</code> sends bytes as they are. The settings are made on the
+          client side: CODESYS publishes them (<code>baudrate/set</code>, <code>format/set</code>, <code>framegap/set</code>);
+          this page only shows them (read only). RS-232 / RS-485 is set in the WBM (Interfaces &gt; Serial Interface, owner "None").</p>
+        <p class="note" id="ser-off" style="display:none">COM1 is off in the gateway (SERIAL_DEVICE empty), or the gateway has not published it yet.</p>
+        <div class="form collapsible" id="ser-form"><span class="title">Communication Parameters</span><div class="body">
+          <div class="field"><label>State</label><div class="control" id="ser-open">–</div></div>
+          <div class="field"><label>Baud Rate</label><div class="control value" id="ser-baud">–</div></div>
+          <div class="field"><label>Format</label><div class="control value" id="ser-format">–</div></div>
+          <div class="field"><label>Frame Gap</label><div class="control value" id="ser-gap"
+            title="A pause of this length ends a received frame">–</div></div>
+        </div></div>
+        <div class="form collapsible" id="ser-mon"><span class="title">Monitor</span><div class="body">
+          <div class="field"><label>Sent / Received</label><div class="control value" id="ser-counts">–</div></div>
+          <div class="field"><label>Frames / Dropped / Errors</label><div class="control value" id="ser-frames"
+            title="Dropped: frames lost because the queue of the gateway was full. Errors: line errors (framing, parity, overrun)">–</div></div>
+          <div class="field"><label for="ser-tx">Send (test)</label><div class="control"><input type="text" id="ser-tx" maxlength="512"
+            placeholder="text; \r \n \xNN for bytes"></div></div>
+          <div class="buttons"><button class="w" id="ser-send">Send</button></div>
+          <table class="grid"><thead><tr><th>Received</th><th>Bytes</th><th>Frame</th></tr></thead>
+            <tbody id="ser-rx"></tbody></table>
+        </div></div>
+        <p class="note">The last 10 frames received while this page is open; non-printable bytes are shown as <code>&lt;XX&gt;</code> (hex).</p>
       </div>
 
       <!-- MQTT / Topics -->
       <div class="wbm-page" id="page-mqtt-topics">
         <h2 class="page">MQTT Topics</h2>
         <div class="form wide"><span class="title">Topics on the Broker</span><div class="body">
-          <div class="toolbar"><input type="search" id="tfilter" placeholder="Filter by topic"><span id="tcount"></span></div>
+          <div class="toolbar"><input type="search" id="tfilter" placeholder="Filter by topic"><span id="tcount"></span>
+            <span id="ctlnote" class="auth-only"></span><button class="w auth-only" id="takectl"
+              title="Make the values of the outputs (kbus/do/&lt;n&gt;, kbus/ao/&lt;n&gt;) editable">Take Control</button></div>
           <table class="grid"><thead><tr><th>Topic</th><th>Value</th><th>Updated</th></tr></thead>
             <tbody id="ttable"></tbody></table>
         </div></div>
-        <p class="note">Everything the page receives: <code id="sub-list">kbus/#</code>. Write topics (<code>…/set</code>) are not retained and therefore not listed.</p>
+        <p class="note">Everything the page receives: <code id="sub-list">kbus/#</code>. Command topics (<code>…/set</code>, e.g. <code>kbus/do/1/set</code>) are not listed: they are requests to change something; the row without <code>/set</code> (<code>kbus/do/1</code>) is the actual state.
+          To change outputs: log in, press <em>Take Control</em>, then click the value of <code>kbus/do/&lt;n&gt;</code>
+          (<code>true</code>/<code>false</code>) or <code>kbus/ao/&lt;n&gt;</code> (0–65535), type the new value and press Enter (Esc = cancel).
+          Another program that writes the same outputs cyclically (e.g. CODESYS) overwrites them in its next cycle.</p>
       </div>
 
       <!-- MQTT / Clients -->
@@ -104,9 +128,9 @@
           controller (127.0.0.1) is shown as CODESYS; the KBUS Manager pages themselves are not shown.</p>
       </div>
 
-      <!-- Settings / KBUS Cycle -->
+      <!-- Settings / KBUS -->
       <div class="wbm-page" id="page-settings-cycle">
-        <h2 class="page">KBUS Cycle</h2>
+        <h2 class="page">KBUS</h2>
         <p class="note">Changes take effect at the next cycle and are kept after a restart (<code>kbus/bus/cycletime/set</code>).</p>
         <div class="form collapsible"><span class="title">Cycle Time</span><div class="body">
           <div class="field"><label>Current Cycle Time</label><div class="control value" id="cyc-now">–</div></div>

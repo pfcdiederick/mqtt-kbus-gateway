@@ -34,6 +34,12 @@ The container starts empty: download the application with the IDE
 | Several outputs in one KBUS cycle | publish `kbus/do/all/set` = `[true,false,null,...]` (`null` = unchanged) |
 | Is the I/O current? | `kbus/status` = `online` and `kbus/bus/healthy` = `true` |
 | Rejected writes | subscribe `kbus/error` |
+| Temperatures of a 750-450 | subscribe `kbus/module/<pos>/temperature/<n>` (°C, e.g. `21.4`) |
+| Write watchdog (if `MQTT_WATCHDOG_S` is set) | publish `kbus/watchdog/set` (any value, without retain) at least every N/2 s; `kbus/watchdog` = `expired` means the outputs were switched to 0 |
+| 750-671 stepper | publish `kbus/module/<pos>/stepper/cmd/set` = `{"cmd":"enable"}`, `{"cmd":"move","position":P,"velocity":V,"acceleration":A,"id":"1"}`, `{"cmd":"stop"}` …; subscribe `kbus/module/<pos>/stepper/response` (`accepted` / `done` / `error`) and `.../stepper/state` (README 3.12) |
+| COM1: receive | subscribe `kbus/serial/com1/rx`: one message per frame, binary (README 3.9) |
+| COM1: send | publish `kbus/serial/com1/tx/set` = 1..512 bytes, binary, **without retain** |
+| COM1: settings | publish `kbus/serial/com1/baudrate/set`, `format/set` (e.g. `8E1`), `framegap/set` (ms) only when they differ from the retained `kbus/serial/com1/baudrate`, `format`, `framegap` |
 | Data from other brokers | as configured in the mqtt-bridge, e.g. `homeassistant/sensor/.../state` |
 
 Recommendations:
@@ -59,3 +65,7 @@ module 2 = 750-495 (no channels).
 
 The CODESYS project and the ST code of the HTTP/wdx version are in the original
 project `docker-wdx-kbus-interface/codesys`. ST code for MQTT is not written yet.
+
+## Prompt for Claude in CODESYS
+
+[PROMPT-for-Claude-in-CODESYS.md](PROMPT-for-Claude-in-CODESYS.md): ready-to-paste task for Claude in CODESYS (MCP) that builds the MQTT interface of the test node: digital outputs, 750-450 temperatures, `FB_MqttStepper` (750-671 through the gateway driver) and `FB_MqttIoLinkBridge` (750-657 with the standard WAGO IO-Link FB over the raw process image).

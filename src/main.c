@@ -4,13 +4,16 @@
 // cycle in a real-time thread and makes every DI / DO / AI / AO channel, the
 // module list and the bus status available on an MQTT broker (mosquitto on the
 // controller). Outputs are written with <prefix>/do/<n>/set and <prefix>/ao/<n>/set.
+// The serial interface COM1 is forwarded transparently (<prefix>/serial/com1/...).
 // Runs natively on the PTXdist firmware (opkg package, tools/build-ipk.sh) or
 // as a container (docker/gateway).
 #include "backend.h"
 #include "config.h"
 #include "gateway.h"
 #include "log.h"
+#include "modules.h"
 #include "mqtt_io.h"
+#include "serial.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -36,6 +39,7 @@ int main(void)
     config_load(&cfg);
     config_load_stored(&cfg);           // cycle time written via <prefix>/bus/cycletime/set
     config_log(&cfg);
+    module_desc_init(&cfg);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -58,9 +62,12 @@ int main(void)
         return 1;
     }
 
+    serial_start(&cfg);                 // COM1 (SERIAL_DEVICE), transparent forwarding over MQTT
+
     const int rc = mqtt_io_run(&cfg, &g_stop);
 
     LOG_INFO("shutting down");
+    serial_stop();
     gateway_stop();
     return rc == 0 ? 0 : 1;
 }
