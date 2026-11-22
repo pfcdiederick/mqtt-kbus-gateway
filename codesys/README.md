@@ -18,7 +18,7 @@ FW 31, the BACnet component that needs them). Therefore:
 
 - the CODESYS project must **not contain a KBus** in its device tree;
 - BACnet is not available in CODESYS in this setup;
-- use the device description of the controller's firmware (PFC300, FW 31).
+- use the device description of the controller's firmware.
 
 The container starts empty: download the application with the IDE
 (`<pfc-ip>`, port 11740). Application and settings are kept in
@@ -35,12 +35,17 @@ The container starts empty: download the application with the IDE
 | Is the I/O current? | `kbus/status` = `online` and `kbus/bus/healthy` = `true` |
 | Rejected writes | subscribe `kbus/error` |
 | Temperatures of a 750-450 | subscribe `kbus/module/<pos>/temperature/<n>` (°C, e.g. `21.4`) |
+| Status of an analog input | subscribe `kbus/ai/<n>/status` (0 = no error) |
 | Write watchdog (if `MQTT_WATCHDOG_S` is set) | publish `kbus/watchdog/set` (any value, without retain) at least every N/2 s; `kbus/watchdog` = `expired` means the outputs were switched to 0 |
-| 750-671 stepper | publish `kbus/module/<pos>/stepper/cmd/set` = `{"cmd":"enable"}`, `{"cmd":"move","position":P,"velocity":V,"acceleration":A,"id":"1"}`, `{"cmd":"stop"}` …; subscribe `kbus/module/<pos>/stepper/response` (`accepted` / `done` / `error`) and `.../stepper/state` (README 3.12) |
-| COM1: receive | subscribe `kbus/serial/com1/rx`: one message per frame, binary (README 3.9) |
+| 750-671 stepper | publish `kbus/module/<pos>/stepper/cmd/set` = `{"cmd":"enable"}`, `{"cmd":"move","position":P,"velocity":V,"acceleration":A,"id":"1"}`, `{"cmd":"stop"}` …; subscribe `.../stepper/response` (`accepted` / `done` / `error`) and `.../stepper/state` |
+| 750-495, 750-657 (raw data) | subscribe `kbus/module/<pos>/in`, publish `kbus/module/<pos>/out/set` (binary, without retain); see below |
+| COM1: receive | subscribe `kbus/serial/com1/rx`: one message per frame, binary |
 | COM1: send | publish `kbus/serial/com1/tx/set` = 1..512 bytes, binary, **without retain** |
 | COM1: settings | publish `kbus/serial/com1/baudrate/set`, `format/set` (e.g. `8E1`), `framegap/set` (ms) only when they differ from the retained `kbus/serial/com1/baudrate`, `format`, `framegap` |
 | Data from other brokers | as configured in the mqtt-bridge, e.g. `homeassistant/sensor/.../state` |
+
+All details: [docs/MANUAL.md](../docs/MANUAL.md) (topics: section 3, module
+functions: section 4, COM1: section 5).
 
 Recommendations:
 
@@ -54,18 +59,87 @@ Recommendations:
 
 ## The 750-495 with the standard WAGO function block
 
-The power measurement module has no channels; kbus-gateway passes its 24 raw
-input and output bytes through MQTT (`kbus/module/2/in`,
-`kbus/module/2/out/set`), so the standard function block of
-WagoAppPowerMeasurement can be used as "virtual I/O". Step-by-step guide,
-ST skeleton, timing and checks: main [README](../README.md), section 3.8.
+On a normal PFC the 750-495 sits in the KBus device tree, its 24 input and 24
+output bytes are mapped to variables, and the function block of the WAGO
+library **WagoAppPowerMeasurement** works with those variables. Here the
+CODESYS runtime has no KBus, so the same 24 bytes come and go through MQTT
+instead ("virtual I/O"). The function block does not notice the difference.
 
-Current node (PFC300, 18-11-2026): module 1 = 8DO → `kbus/do/1` … `kbus/do/8`;
-module 2 = 750-495 (no channels).
+```
+ 750-495 ◀─KBUS─▶ kbus-gateway ── kbus/module/2/in      (24 bytes) ──▶ CODESYS: copy into the FB's input bytes
+                              ◀── kbus/module/2/out/set (24 bytes) ◀── CODESYS: the FB's output bytes
+```
 
-The CODESYS project and the ST code of the HTTP/wdx version are in the original
-project `docker-wdx-kbus-interface/codesys`. ST code for MQTT is not written yet.
+1. **Check the function block.** In the library manager, open the 750-495
+   function block of WagoAppPowerMeasurement. It must take the module's
+   process data as **ordinary variables** (an input and an output structure
+   or byte array of 24 bytes each). If it needs a reference to the KBus
+   device instead, this route does not work.
+2. **Device tree:** no KBus. Add the MQTT client library you already use;
+   broker `127.0.0.1:1883`.
+3. **Subscribe** to `kbus/module/2/in` (`2` = position of the module in the
+   node, see `kbus/modules`). Payload: binary, exactly 24 bytes from one KBUS
+   cycle. Copy them into the function block's input variable when a message
+   arrives.
+4. **Call the function block** every task cycle, as usual.
+5. **Publish** the function block's 24 output bytes on
+   `kbus/module/2/out/set` when they change (binary, exactly 24 bytes,
+   **retain off**, QoS 0 or 1). This is also needed when the application only
+   reads measured values: the function block requests every value through
+   these bytes. kbus-gateway rejects any other length (`kbus/error`).
+6. **Watch** `kbus/status` (`online`) and `kbus/bus/healthy` (`true`). After a
+   restart of kbus-gateway the output bytes are 0 until the application writes
+   them again: reset the copy of the last sent bytes when `kbus/status`
+   becomes `online`, so step 5 sends them again.
 
-## Prompt for Claude in CODESYS
+Skeleton in ST. The publish block, the 750-495 function block and their
+parameters are written as comments, because they depend on the library
+versions in the project:
 
-[PROMPT-for-Claude-in-CODESYS.md](PROMPT-for-Claude-in-CODESYS.md): ready-to-paste task for Claude in CODESYS (MCP) that builds the MQTT interface of the test node: digital outputs, 750-450 temperatures, `FB_MqttStepper` (750-671 through the gateway driver) and `FB_MqttIoLinkBridge` (750-657 with the standard WAGO IO-Link FB over the raw process image).
+```iecst
+VAR
+    oFbSubscribeIn : (* subscribe block of your MQTT library *);   // kbus/module/2/in
+    oFbPublishOut  : (* publish block of the same library *);      // kbus/module/2/out/set
+    aRxIn          : ARRAY[0..1023] OF BYTE;       // payload buffer of the subscription
+    aIn495         : ARRAY[0..23] OF BYTE;         // = the module's input bytes (normally %IB mapping)
+    aOut495        : ARRAY[0..23] OF BYTE;         // = the module's output bytes (normally %QB mapping)
+    aOutSent       : ARRAY[0..23] OF BYTE;         // last bytes published
+    fbPM495        : (* 750-495 FB of WagoAppPowerMeasurement *);
+    i              : INT;
+    xChanged       : BOOL;
+END_VAR
+
+// 1. input bytes from MQTT
+oFbSubscribeIn(xSubscribe := TRUE, sTopic := 'kbus/module/2/in', aPayloadData := aRxIn);
+IF oFbSubscribeIn.xDataReceived AND oFbSubscribeIn.dwRxNBytes = 24 THEN
+    FOR i := 0 TO 23 DO
+        aIn495[i] := aRxIn[i];
+    END_FOR
+END_IF
+
+// 2. the standard function block, with aIn495 / aOut495 instead of the mapped I/O
+fbPM495( (* input bytes := aIn495, output bytes => aOut495, ... *) );
+
+// 3. output bytes to MQTT, only when they changed
+xChanged := FALSE;
+FOR i := 0 TO 23 DO
+    IF aOut495[i] <> aOutSent[i] THEN xChanged := TRUE; END_IF
+END_FOR
+IF xChanged (* AND the publish block is not busy *) THEN
+    aOutSent := aOut495;
+    (* publish aOutSent: topic 'kbus/module/2/out/set', 24 bytes, retain FALSE *)
+END_IF
+```
+
+Adapt the names and parameters of the MQTT function blocks to your library,
+and the 750-495 function block's in/out variables to its declaration.
+
+- **Timing.** Every request of the function block now takes a round trip
+  through MQTT (CODESYS → broker → kbus-gateway → next KBUS cycle → module →
+  kbus-gateway → broker → CODESYS), roughly 10–50 ms instead of one KBUS
+  cycle. Measured values every second or so are no problem. If the function
+  block has a time-out for the module's answer, set it to at least 500 ms.
+- **One writer.** Only this CODESYS application may publish
+  `kbus/module/2/out/set`. The KBUS Manager page cannot write it.
+- **Diagnosis:** `mosquitto_sub -h <pfc-ip> -t kbus/module/2/in -F "%U %x"`
+  (time + 24 bytes in hex).

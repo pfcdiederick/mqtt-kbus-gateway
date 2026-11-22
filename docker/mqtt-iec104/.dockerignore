@@ -1,0 +1,4 @@
+# Build context of docker/mqtt-iec104/Dockerfile: only these files.
+*
+!mqtt_iec104.py
+!mqtt-iec104.yaml

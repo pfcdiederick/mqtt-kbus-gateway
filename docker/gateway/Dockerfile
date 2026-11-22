@@ -2,7 +2,7 @@
 #
 # kbus-gateway (WAGO KBUS <-> MQTT) as a container - multi-platform build with docker buildx.
 # Alternative to the native package (tools/build-ipk.sh); run it with
-# tools/deploy-docker.sh, which knows the mounts the KBUS access needs (README 2.8).
+# tools/deploy-docker.sh, which knows the mounts the KBUS access needs (docs/MANUAL.md 2.8).
 # The build context is the PROJECT ROOT (src/, sdk/, VERSION); ignore file:
 # Dockerfile.dockerignore next to this file. From the project root:
 #

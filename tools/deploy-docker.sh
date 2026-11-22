@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run kbus-gateway as a Docker container on the PFC instead of the native package
-# (or switch back), and optionally the broker, the mqtt-bridge and the mqtt-manager.
+# (or switch back), and optionally the broker, the mqtt-bridge, the mqtt-manager, the
+# IEC 104 gateway and the Modbus bridge.
 #
 #   tools/deploy-docker.sh <pfc-ip> [options]
 #     (no option)    kbus-gateway container (replaces the native service)
@@ -8,11 +9,15 @@
 #     --mosquitto    also the broker: kbus-mosquitto (docker/mosquitto, configuration built in)
 #     --manager      also the mqtt-manager (docker/mqtt-manager, optional): the KBUS Manager page at
 #                    http(s)://<pfc>/kbus/, linked in the WAGO web server
+#     --iec104       also the mqtt-iec104 gateway (docker/mqtt-iec104): MQTT <-> IEC 60870-5-104
+#                    server on port 2404, mapping in /home/mqtt-iec104/mqtt-iec104.yaml
+#     --modbus       also the mqtt-modbus bridge (docker/mqtt-modbus): Modbus TCP devices <-> MQTT,
+#                    configuration in /home/mqtt-modbus/mqtt-modbus.yaml
 #     --sim          kbus-gateway in simulation mode (KBUS_SIMULATION=1: no real KBUS access,
 #                    e.g. while CODESYS still owns the KBUS)
 #     --no-gateway   leave kbus-gateway as it is (native or container); e.g. only --bridge
 #     --native       remove the kbus-gateway container, native service again
-#   Images: docker/<gateway|mqtt-bridge|mosquitto|mqtt-manager>/Dockerfile (docker/README.md); archives: build-docker/
+#   Images: docker/<gateway|mqtt-bridge|mosquitto|mqtt-manager|mqtt-iec104|mqtt-modbus>/Dockerfile (docker/README.md); archives: build-docker/
 #   All containers run with --restart unless-stopped: they come back after a reboot.
 #
 # Only one program may own the KBUS: the native service is stopped and its boot
@@ -24,22 +29,28 @@
 #   GW_ENV          extra docker run arguments for kbus-gateway, e.g. "-e MQTT_TOPIC_PREFIX=line1/kbus"
 #   BR_ENV          extra docker run arguments for the mqtt-bridge
 #   MG_ENV          extra docker run arguments for the mqtt-manager, e.g. "-e MGMT_READONLY=1"
+#   IE_ENV          extra docker run arguments for the mqtt-iec104 gateway
+#   MB_ENV          extra docker run arguments for the mqtt-modbus bridge
 #
 # Files on the controller (created at the first deployment, then kept):
 #   /home/mqtt-bridge/mqtt-bridge.ini   bridge configuration (+ certificates); docker restart mqtt-bridge
 #   /home/mosquitto/data/                retained values of the broker
 #   /home/mqtt-manager/settings.json     login of the KBUS Manager page
+#   /home/mqtt-iec104/mqtt-iec104.yaml   IEC 104 mapping; docker restart mqtt-iec104
+#   /home/mqtt-modbus/mqtt-modbus.yaml   Modbus devices and tags; docker restart mqtt-modbus
 # The broker configuration is built into the image: docker/mosquitto/mosquitto.conf.
 set -euo pipefail
 
-PFC=${1:?usage: $0 <pfc-ip> [--bridge] [--mosquitto] [--manager] [--sim] [--no-gateway] | --native}
+PFC=${1:?usage: $0 <pfc-ip> [--bridge] [--mosquitto] [--manager] [--iec104] [--modbus] [--sim] [--no-gateway] | --native}
 shift
-GW=1; BR=0; MQ=0; MG=0; NATIVE=0; SIM=0
+GW=1; BR=0; MQ=0; MG=0; IE=0; MB=0; NATIVE=0; SIM=0
 for a in "$@"; do
     case "$a" in
         --bridge)     BR=1 ;;
         --mosquitto)  MQ=1 ;;
         --manager)    MG=1 ;;
+        --iec104)     IE=1 ;;
+        --modbus)     MB=1 ;;
         --no-gateway) GW=0 ;;
         --native)     NATIVE=1 ;;
         --sim)        SIM=1 ;;
@@ -75,6 +86,10 @@ MQ_IMG=kbus-mosquitto:$ARCH
 MQ_TAR=$OUT/kbus-mosquitto-$ARCH.tar.gz
 MG_IMG=mqtt-manager:$ARCH
 MG_TAR=$OUT/mqtt-manager-$ARCH.tar.gz
+IE_IMG=mqtt-iec104:$ARCH
+IE_TAR=$OUT/mqtt-iec104-$ARCH.tar.gz
+MB_IMG=mqtt-modbus:$ARCH
+MB_TAR=$OUT/mqtt-modbus-$ARCH.tar.gz
 echo ">>> controller $PFC is $machine -> $PLATFORM"
 
 if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
@@ -98,6 +113,15 @@ if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
         docker buildx build --platform "$PLATFORM" -t "$MG_IMG" -f "$ROOT/docker/mqtt-manager/Dockerfile" --load "$ROOT"
         save "$MG_IMG" "$MG_TAR"
     fi
+    if [[ $IE == 1 ]]; then
+        [[ $ARCH == arm64 ]] || { echo "mqtt-iec104: c104 has no prebuilt wheel for $ARCH (only arm64)" >&2; exit 1; }
+        docker buildx build --platform "$PLATFORM" -t "$IE_IMG" --load "$ROOT/docker/mqtt-iec104"
+        save "$IE_IMG" "$IE_TAR"
+    fi
+    if [[ $MB == 1 ]]; then
+        docker buildx build --platform "$PLATFORM" -t "$MB_IMG" --load "$ROOT/docker/mqtt-modbus"
+        save "$MB_IMG" "$MB_TAR"
+    fi
 else
     echo ">>> 1/4 SKIP_BUILD=1: using $OUT"
 fi
@@ -107,6 +131,8 @@ echo ">>> 2/4 loading images on the controller"
 [[ $BR == 1 ]] && $SSH docker load < "$BR_TAR"
 [[ $MQ == 1 ]] && $SSH docker load < "$MQ_TAR"
 [[ $MG == 1 ]] && $SSH docker load < "$MG_TAR"
+[[ $IE == 1 ]] && $SSH docker load < "$IE_TAR"
+[[ $MB == 1 ]] && $SSH docker load < "$MB_TAR"
 
 if [[ $MQ == 1 ]]; then
     echo ">>> starting the broker (port 1883)"
@@ -172,13 +198,39 @@ if [[ $MG == 1 ]]; then
               -v /home/mqtt-manager:/data -v /etc/localtime:/etc/localtime:ro ${MG_ENV:-} $MG_IMG >/dev/null"
 fi
 
+if [[ $IE == 1 ]]; then
+    echo ">>> starting the mqtt-iec104 gateway (IEC 104 server on port 2404)"
+    $SSH "mkdir -p /home/mqtt-iec104 && chmod 700 /home/mqtt-iec104"
+    if ! $SSH test -s /home/mqtt-iec104/mqtt-iec104.yaml; then
+        $SSH "umask 077; cat > /home/mqtt-iec104/mqtt-iec104.yaml" < "$ROOT/docker/mqtt-iec104/mqtt-iec104.yaml"
+        echo "default IEC 104 mapping created: /home/mqtt-iec104/mqtt-iec104.yaml (adapt it to your node)"
+    fi
+    $SSH "docker rm -f mqtt-iec104 >/dev/null 2>&1 || true
+          docker run -d --name mqtt-iec104 --restart unless-stopped --network host ${IE_ENV:-} \
+              -v /home/mqtt-iec104:/config:ro -v /etc/localtime:/etc/localtime:ro $IE_IMG >/dev/null"
+fi
+
+if [[ $MB == 1 ]]; then
+    echo ">>> starting the mqtt-modbus bridge"
+    $SSH "mkdir -p /home/mqtt-modbus && chmod 700 /home/mqtt-modbus"
+    if ! $SSH test -s /home/mqtt-modbus/mqtt-modbus.yaml; then
+        $SSH "umask 077; cat > /home/mqtt-modbus/mqtt-modbus.yaml" < "$ROOT/docker/mqtt-modbus/mqtt-modbus.yaml"
+        echo "example Modbus configuration created: /home/mqtt-modbus/mqtt-modbus.yaml (enter your devices)"
+    fi
+    $SSH "docker rm -f mqtt-modbus >/dev/null 2>&1 || true
+          docker run -d --name mqtt-modbus --restart unless-stopped --network host ${MB_ENV:-} \
+              -v /home/mqtt-modbus:/config:ro -v /etc/localtime:/etc/localtime:ro $MB_IMG >/dev/null"
+fi
+
 echo ">>> 4/4 status"
 # shellcheck disable=SC2016
-$SSH 'sleep 4; docker ps -a --filter name=kbus-gateway --filter name=mqtt-bridge --filter name=mosquitto --filter name=mqtt-manager \
+$SSH 'sleep 4; docker ps -a --filter name=kbus-gateway --filter name=mqtt-bridge --filter name=mosquitto --filter name=mqtt-manager --filter name=mqtt-iec104 --filter name=mqtt-modbus \
           --format "{{.Names}}: {{.Status}}";
       grep "kbus-gateway\[" /var/log/messages | tail -8'
 [[ $BR == 1 ]] && echo ">>> bridge: ssh $PFC_USER@$PFC docker logs -f mqtt-bridge  (configuration: /home/mqtt-bridge/mqtt-bridge.ini)"
 echo ">>> topics: mosquitto_sub -h $PFC -t 'kbus/#' -t 'bridge/#' -v"
 [[ $MG == 1 ]] && echo ">>> KBUS Manager: http://$PFC/kbus  (log: ssh $PFC_USER@$PFC docker logs mqtt-manager)"
+[[ $IE == 1 ]] && echo ">>> IEC 104: $PFC:2404  (log: ssh $PFC_USER@$PFC docker logs -f mqtt-iec104; mapping: /home/mqtt-iec104/mqtt-iec104.yaml)"
+[[ $MB == 1 ]] && echo ">>> Modbus: mosquitto_sub -h $PFC -t 'modbus/#' -v  (log: ssh $PFC_USER@$PFC docker logs -f mqtt-modbus; configuration: /home/mqtt-modbus/mqtt-modbus.yaml)"
 [[ $GW == 1 ]] && echo ">>> done. Back to the native service: $0 $PFC --native"
 exit 0
