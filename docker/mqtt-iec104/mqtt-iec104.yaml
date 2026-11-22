@@ -1,0 +1,96 @@
+# mqtt-iec104: MQTT <-> IEC 60870-5-104 gateway
+#
+# On the controller: /home/mqtt-iec104/mqtt-iec104.yaml (created from this file at the
+# first deployment, then kept). After a change: docker restart mqtt-iec104
+# Check a file without starting: docker run --rm -v /home/mqtt-iec104:/config:ro mqtt-iec104:arm64 --check
+#
+# The example maps the KBUS node of kbus-gateway (topic prefix "kbus"). Adapt the
+# counts and IOAs to your node (kbus/modules shows the channels).
+
+general:
+  log_level: INFO          # DEBUG shows every value
+  stale_after: 0           # s without a new value -> quality NonTopical; 0 = off (kbus publishes only changes!)
+
+mqtt:
+  host: 127.0.0.1          # the broker on the PFC
+  port: 1883
+  client_id: ""            # "" = mqtt-iec104-<hostname>
+  username: ""
+  password: ""
+  keepalive: 30
+  qos: 0
+  tls: false
+  ca_cert: ""              # file in /home/mqtt-iec104/ -> /config/<file>; "" = system CAs
+  tls_insecure: false
+  status_topic: iec104/status   # online / offline (retained, last will); "" = none
+  # All values are Invalid and commands are refused while this topic is not "online".
+  # Remove it (or topic: "") when the points do not come from kbus-gateway.
+  availability:
+    topic: kbus/status
+    online: online
+
+iec104:
+  ip: 0.0.0.0              # listen on all interfaces (the SCADA connects to the PFC's IP)
+  port: 2404
+  max_connections: 0       # 0 = unlimited
+  common_address: 1        # ASDU address of the station
+  report_ms: 0             # 0 = only spontaneous on change; > 0 = also cyclic every N ms
+  command_mode: direct     # direct | select (select-before-operate)
+
+# MQTT -> IEC 104. One entry per topic, or a series with {n} and count:
+#   topic   MQTT topic, {n} = start, start+1, ... (no wildcards)
+#   ioa     information object address (of the first one; count entries get ioa, ioa+1, ...)
+#   type    single  M_SP_TB_1 (30)  true/false, on/off, 1/0 (a number != 0 is true)
+#           float   M_ME_TF_1 (36)  short float
+#           scaled  M_ME_TE_1 (35)  INT16 -32768..32767 (outside: clamped, quality Overflow)
+#   count   number of entries (default 1)      start  first {n} (default 1)
+#   key     JSON payload: field (dotted path), e.g. position; default: plain value or {"value": ..}
+#   scale, offset   IEC value = MQTT value * scale + offset (float/scaled)
+#   report_ms       overrides iec104.report_ms for this entry
+#   name            free text, for yourself
+points:
+  - topic: kbus/di/{n}                 # digital inputs 1..8 -> IOA 101..108
+    count: 8
+    ioa: 101
+    type: single
+  - topic: kbus/do/{n}                 # state of the digital outputs 1..8 -> IOA 201..208
+    count: 8
+    ioa: 201
+    type: single
+  - topic: kbus/ai/{n}                 # analog inputs 1..4, raw 0..32767 -> 0..100 %, IOA 301..304
+    count: 4
+    ioa: 301
+    type: float
+    scale: 0.0030518                   # 100 / 32767
+  - topic: kbus/module/3/temperature/{n}   # 750-450 at position 3, degC -> IOA 401..404
+    count: 4
+    ioa: 401
+    type: float
+  - topic: kbus/bus/healthy            # KBUS running without errors -> IOA 901
+    ioa: 901
+    type: single
+
+# IEC 104 -> MQTT. A command of an IEC 104 client is published on the topic.
+#   type    single  C_SC_NA_1 (45)  publishes 'on' / 'off' (default true / false)
+#           float   C_SE_NC_1 (50)  short float set point
+#           scaled  C_SE_NB_1 (49)  INT16 set point
+#   count, start, ioa, name   as above
+#   scale, offset   MQTT value = IEC value * scale + offset
+#   integer         publish as integer (default: true for scaled, false for float)
+#   min, max        refuse values outside (after scaling): negative confirmation
+#   retain          default false. Keep false for kbus .../set topics (kbus-gateway ignores retained commands)
+# The client gets a positive confirmation when the value is published, a negative one when the
+# broker is not connected or the availability topic is not online.
+commands:
+  - topic: kbus/do/{n}/set             # switch digital outputs 1..8 with IOA 1101..1108
+    count: 8
+    ioa: 1101
+    type: single
+  - topic: kbus/ao/{n}/set             # analog outputs 1..2: 0..100 % -> raw 0..32767, IOA 1201..1202
+    count: 2
+    ioa: 1201
+    type: float
+    scale: 327.67
+    integer: true
+    min: 0
+    max: 32767

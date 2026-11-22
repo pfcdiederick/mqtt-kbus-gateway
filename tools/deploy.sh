@@ -13,7 +13,7 @@
 #   SKIP_BUILD  1 = install the existing build-ipk/kbus-gateway_<version>_<arch>.ipk
 #
 # Before the first install: only one program may own the KBUS. Set WBM > PLC
-# Runtime to "None", or run the CODESYS runtime without KBUS (README 2.2).
+# Runtime to "None", or run the CODESYS runtime without KBUS (docs/MANUAL.md 2.2).
 set -euo pipefail
 
 PFC=${1:?usage: $0 <pfc-ip>}
@@ -49,4 +49,4 @@ $SSH 'sleep 3; /etc/init.d/kbus-gateway status; P=$(cat /var/run/kbus-gateway.pi
       grep "kbus-gateway\[$P\]" /var/log/messages | tail -12'
 echo ">>> done. Watch the topics (on the controller, or from the PC when mosquitto listens on the network):"
 echo "    mosquitto_sub -h $PFC -t 'kbus/#' -v"
-echo "    tests/test-mqtt.py $PFC node        (read only, README 2.7)"
+echo "    tests/test-mqtt.py $PFC node        (read only, docs/MANUAL.md 2.7)"

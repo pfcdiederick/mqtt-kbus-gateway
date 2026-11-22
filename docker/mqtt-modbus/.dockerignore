@@ -1,0 +1,4 @@
+# Build context of docker/mqtt-modbus/Dockerfile: only these files.
+*
+!mqtt_modbus.py
+!mqtt-modbus.yaml

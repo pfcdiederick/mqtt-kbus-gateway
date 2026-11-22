@@ -3,8 +3,13 @@
 // own real-time thread (gateway.c); the two share only the locked process images.
 #include "mqtt_io.h"
 #include "gateway.h"
+#include "json.h"
 #include "log.h"
+#include "modules.h"
 #include "mqtt_client.h"
+#include "regcom.h"
+#include "serial.h"
+#include "stepper.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -48,9 +53,42 @@ static struct {
     uint8_t  raw_pub[KBUS_MAX_MODULES][GW_MODULE_RAW_MAX];
     uint8_t  raw_len[KBUS_MAX_MODULES];                 // bytes last published (0 = topic not published)
     uint16_t raw_pos[KBUS_MAX_MODULES];                 // position the topic was published for
+    int64_t  raw_next_ms[KBUS_MAX_MODULES];             // MQTT_RAW_MIN_MS: earliest next publish
+
+    // serial interface COM1: <prefix>/serial/com1/... (values last published)
+    serial_snapshot_t ser_pub;
+    int      ser_valid;                                 // ser_pub holds published values
+    int64_t  next_ser_stats_ms;
+
+    // functional values of module descriptors (modules.h), per AI channel (index = n-1):
+    // <prefix>/module/<pos>/<function>/<module channel>
+    uint16_t f_pub[GW_MAX_CHANNELS];                    // raw word last published
+    uint8_t  f_valid[GW_MAX_CHANNELS];                  // topic published
+    uint16_t f_pos[GW_MAX_CHANNELS], f_ch[GW_MAX_CHANNELS];
+    const char *f_func[GW_MAX_CHANNELS];
+
+    uint8_t  stp_pub[256];                              // positions with a published stepper/state
+
+    // status register of the AI channels (regcom.h): <prefix>/ai/<n>/status, index = n-1
+    uint16_t st_pub[GW_MAX_CHANNELS];                   // value last published
+    uint8_t  st_valid[GW_MAX_CHANNELS];                 // topic published by this run
+    uint8_t  st_seen[GW_MAX_CHANNELS];                  // retained topic of an earlier run found
+
+    // write watchdog (MQTT_WATCHDOG_S)
+    int      wd_armed;                                  // a write or watchdog/set was received
+    int      wd_expired;                                // outputs were switched to 0
+    int64_t  wd_last_ms;
+    int      wd_pub;                                    // -1 = not published, else wd_expired
 } m;
 
 static int is_digital(io_kind_t k) { return k == IO_DI || k == IO_DO; }
+
+// Module with a functional driver in the gateway (750-671 stepper): its raw outputs
+// belong to the driver.
+static int is_stepper(const kbus_module_t *mod)
+{
+    return mod->type == 671 && mod->in_size_bits == 8 * STEPPER_PI_BYTES && mod->out_size_bits == 8 * STEPPER_PI_BYTES;
+}
 
 // ---------------------------------------------------------------------------
 // Publishing
@@ -112,7 +150,7 @@ static void pub_modules(void)
 {
     size_t count = 0;
     const kbus_module_t *mods = gateway_modules(&count);
-    size_t cap = 64 + count * 160;
+    size_t cap = 64 + count * 256;
     for (int k = 0; k < IO_KIND_COUNT; ++k)
         cap += gateway_channel_count((io_kind_t)k) * 6;
     char *buf = malloc(cap);
@@ -142,6 +180,12 @@ static void pub_modules(void)
                 buf[b++] = ']';
         }
         b += (size_t)snprintf(buf + b, cap - b, "}");
+        const module_desc_t *d = module_desc(mods[mi].type);
+        if (d && gateway_module_has_channels(mi))
+            b += (size_t)snprintf(buf + b, cap - b, ",\"functions\":{\"%s\":{\"unit\":\"%s\",\"resolution\":%g}}",
+                                  d->function, d->unit, d->resolution);
+        if (is_stepper(&mods[mi]))
+            b += (size_t)snprintf(buf + b, cap - b, ",\"driver\":\"stepper\"");
         if (!gateway_module_has_channels(mi) && mods[mi].in_size_bits)
             b += (size_t)snprintf(buf + b, cap - b, ",\"raw\":{\"in\":%u,\"out\":%u}",
                                   (mods[mi].in_size_bits + 7) / 8, (mods[mi].out_size_bits + 7) / 8);
@@ -165,6 +209,174 @@ static void pub_stats(const gw_stats_t *st)
              (unsigned long long)st->errors, (unsigned long long)st->overruns, st->last_cycle_us,
              st->max_cycle_us, st->max_late_us);
     pub("bus/statistics", p, 1);
+}
+
+// COM1: settings and state when changed, statistics when changed (at most 1x per second),
+// every frame received since the last tick as one <prefix>/serial/com1/rx message.
+static void publish_serial(int64_t now)
+{
+    serial_snapshot_t s;
+    serial_snapshot(&s);
+    const serial_snapshot_t *o = &m.ser_pub;
+    const int all = m.full || !m.ser_valid;
+    char v[256];
+    if (all || s.open != o->open)
+        pub("serial/com1/open", s.open ? "true" : "false", 1);
+    if (all || s.baud != o->baud) {
+        snprintf(v, sizeof(v), "%u", (unsigned)s.baud);
+        pub("serial/com1/baudrate", v, 1);
+    }
+    if (all || strcmp(s.format, o->format) != 0)
+        pub("serial/com1/format", s.format, 1);
+    if (all || s.frame_gap_ms != o->frame_gap_ms) {
+        snprintf(v, sizeof(v), "%u", (unsigned)s.frame_gap_ms);
+        pub("serial/com1/framegap", v, 1);
+    }
+    const int stats_changed = s.tx_count != o->tx_count || s.rx_count != o->rx_count ||
+                              s.frame_count != o->frame_count || s.dropped != o->dropped || s.errors != o->errors;
+    serial_snapshot_t keep = s;
+    if (all || (stats_changed && now >= m.next_ser_stats_ms)) {
+        snprintf(v, sizeof(v), "{\"txBytes\":%llu,\"rxBytes\":%llu,\"frames\":%llu,\"dropped\":%llu,\"errors\":%llu}",
+                 (unsigned long long)s.tx_count, (unsigned long long)s.rx_count,
+                 (unsigned long long)s.frame_count, (unsigned long long)s.dropped,
+                 (unsigned long long)s.errors);
+        pub("serial/com1/statistics", v, 1);
+        m.next_ser_stats_ms = now + 1000;
+    } else {                                            // not published yet: compare again next tick
+        keep.tx_count = o->tx_count; keep.rx_count = o->rx_count; keep.frame_count = o->frame_count;
+        keep.dropped = o->dropped; keep.errors = o->errors;
+    }
+    m.ser_pub = keep;
+    m.ser_valid = 1;
+
+    uint8_t frame[SERIAL_BUF];
+    size_t n;
+    char t[256];
+    topic(t, sizeof(t), "serial/com1/rx");
+    while ((n = serial_pop_frame(frame)) > 0) {
+        mqtt_publish(&m.cli, t, frame, n, 0);
+        if (m.cfg->mqtt_log >= 2)
+            LOG_INFO("COM1 received %zu bytes", n);
+    }
+}
+
+// Decimals that show the resolution of a descriptor (0.1 -> 1, 0.01 -> 2, 1 -> 0).
+static int decimals(double res)
+{
+    int d = 0;
+    for (double r = res; r < 0.999 && d < 6; r *= 10)
+        ++d;
+    return d;
+}
+
+static void func_topic(char *t, size_t len, uint16_t pos, const char *func, uint16_t ch)
+{
+    snprintf(t, len, "%s/module/%u/%s/%u", m.cfg->topic_prefix, pos, func, ch);
+}
+
+// Module descriptors: the AI channels of a module with a descriptor (750-450) are
+// also published scaled, as <prefix>/module/<pos>/<function>/<n>. layout = 1: the
+// channel map changed; topics that no longer apply are deleted.
+static void publish_functions(int layout, int band)
+{
+    size_t nmod = 0;
+    const kbus_module_t *mods = gateway_modules(&nmod);
+    const size_t n = gateway_channel_count(IO_AI);
+    char t[256], v[32];
+    for (size_t c = 1; c <= GW_MAX_CHANNELS; ++c) {
+        const module_desc_t *d = NULL;
+        uint16_t pos = 0, mch = 0;
+        if (c <= n) {
+            const io_channel_t *ch = gateway_channel(IO_AI, c);
+            if (ch && ch->mapped && ch->module_index < nmod) {
+                d = module_desc(mods[ch->module_index].type);
+                pos = mods[ch->module_index].position;
+                mch = ch->module_channel;
+            }
+        }
+        const size_t i = c - 1;
+        if (layout && m.f_valid[i] && (!d || m.f_pos[i] != pos || m.f_ch[i] != mch || m.f_func[i] != d->function)) {
+            func_topic(t, sizeof(t), m.f_pos[i], m.f_func[i], m.f_ch[i]);
+            delete_topic(t);
+            m.f_valid[i] = 0;
+        }
+        if (!d)
+            continue;
+        const uint16_t raw = m.cur[IO_AI][i];
+        const int diff = d->is_signed ? abs((int)(int16_t)raw - (int)(int16_t)m.f_pub[i]) : abs((int)raw - (int)m.f_pub[i]);
+        if (m.full || !m.f_valid[i] || diff >= band) {
+            func_topic(t, sizeof(t), pos, d->function, mch);
+            snprintf(v, sizeof(v), "%.*f", decimals(d->resolution), module_value(d, raw));
+            pub(t + strlen(m.cfg->topic_prefix) + 1, v, m.cfg->retain);
+            m.f_pub[i] = raw;
+            m.f_valid[i] = 1;
+            m.f_pos[i] = pos;
+            m.f_ch[i] = mch;
+            m.f_func[i] = d->function;
+        }
+    }
+}
+
+// <prefix>/ai/<n>/status: register 6 of every AI channel (regcom.c), retained, when it changed
+// and after (re)connecting. Removed for channels that no longer exist or whose module has
+// no register access.
+static void publish_ai_status(void)
+{
+    static uint8_t state[GW_MAX_CHANNELS];
+    static uint16_t val[GW_MAX_CHANNELS];
+    const size_t n = gateway_channel_count(IO_AI);
+    regcom_status(state, val, GW_MAX_CHANNELS);
+    char t[64], v[16];
+    for (size_t i = 0; i < GW_MAX_CHANNELS; ++i) {
+        if (i >= n || state[i] == REGCOM_UNSUPPORTED) {
+            if (m.st_valid[i] || m.st_seen[i]) {
+                snprintf(t, sizeof(t), "%s/ai/%zu/status", m.cfg->topic_prefix, i + 1);
+                delete_topic(t);
+                m.st_valid[i] = m.st_seen[i] = 0;
+            }
+            continue;
+        }
+        if (state[i] != REGCOM_VALID || (!m.full && m.st_valid[i] && val[i] == m.st_pub[i]))
+            continue;
+        snprintf(t, sizeof(t), "ai/%zu/status", i + 1);
+        snprintf(v, sizeof(v), "%u", (unsigned)val[i]);
+        pub(t, v, 1);
+        m.st_pub[i] = val[i];
+        m.st_valid[i] = 1;
+        m.st_seen[i] = 0;
+    }
+}
+
+// <prefix>/module/<pos>/reg/value: answer to a reg/get (not retained).
+static void reg_reply(unsigned long pos, long table, long reg, int ok, uint16_t value, const char *err,
+                      const char *id)
+{
+    char p[256], t[64];
+    size_t b = (size_t)snprintf(p, sizeof(p), "{");
+    if (table >= 0)
+        b += (size_t)snprintf(p + b, sizeof(p) - b, "\"table\":%ld,", table);
+    if (reg >= 0)
+        b += (size_t)snprintf(p + b, sizeof(p) - b, "\"register\":%ld,", reg);
+    if (ok)
+        b += (size_t)snprintf(p + b, sizeof(p) - b, "\"value\":%u,\"ok\":true", (unsigned)value);
+    else
+        b += (size_t)snprintf(p + b, sizeof(p) - b, "\"ok\":false,\"error\":\"%s\"", err);
+    if (id && *id)
+        b += (size_t)snprintf(p + b, sizeof(p) - b, ",\"id\":%s", id);
+    snprintf(p + b, sizeof(p) - b, "}");
+    snprintf(t, sizeof(t), "module/%lu/reg/value", pos);
+    pub(t, p, 0);
+}
+
+static void publish_reg_results(void)
+{
+    regcom_result_t r;
+    while (regcom_pop_result(&r)) {
+        reg_reply(r.pos, r.table, r.reg, r.ok, r.value, r.error, r.id);
+        if (m.cfg->mqtt_log >= 2 || (!r.ok && m.cfg->mqtt_log >= 1))
+            LOG_INFO("register read module %u table %u register %u: %s%s", r.pos, r.table, r.reg,
+                     r.ok ? "ok" : "failed: ", r.ok ? "" : r.error);
+    }
 }
 
 // One tick: compare the process image with what was published, publish the differences.
@@ -207,10 +419,24 @@ static void publish_state(void)
         snprintf(v, sizeof(v), "%u", gateway_config_version());
         pub("bus/configversion", v, 1);
         pub_modules();
+        stepper_reset_all();                            // module positions may have changed
+        for (size_t p = 1; p < sizeof(m.stp_pub); ++p) {  // steppers that are gone: delete their state
+            if (!m.stp_pub[p])
+                continue;
+            size_t k;
+            for (k = 0; k < nmod && !(mods[k].position == p && is_stepper(&mods[k])); ++k)
+                ;
+            if (k == nmod) {
+                snprintf(t, sizeof(t), "%s/module/%zu/stepper/state", cfg->topic_prefix, p);
+                delete_topic(t);
+                m.stp_pub[p] = 0;
+            }
+        }
         m.layout = 0;
         m.full = 1;
     }
 
+    const int layout_changed = m.full;                 // m.layout set m.full above
     gateway_snapshot(m.cur);
     const int band = cfg->analog_deadband > 0 ? cfg->analog_deadband : 1;
     for (int k = 0; k < IO_KIND_COUNT; ++k) {
@@ -228,6 +454,10 @@ static void publish_state(void)
             pub_array((io_kind_t)k, count[k]);
     }
 
+    publish_functions(layout_changed, band);
+    publish_ai_status();
+    publish_reg_results();
+
     // raw input bytes of complex modules, one message per module, only when they changed
     size_t nmod = 0;
     const kbus_module_t *mods = gateway_modules(&nmod);
@@ -238,7 +468,11 @@ static void publish_state(void)
         const size_t n = gateway_module_input(mi, raw, sizeof(raw));
         if (n == 0)
             continue;
-        if (m.full || n != m.raw_len[mi] || memcmp(raw, m.raw_pub[mi], n) != 0) {
+        // Rate limit (MQTT_RAW_MIN_MS): a change inside the interval is not lost: the bytes stay
+        // different from raw_pub, so the latest ones are published at the first tick after it.
+        const int changed = n != m.raw_len[mi] || memcmp(raw, m.raw_pub[mi], n) != 0;
+        if (m.full || (changed && now >= m.raw_next_ms[mi])) {
+            m.raw_next_ms[mi] = now + cfg->raw_min_ms;
             char t[256];
             snprintf(t, sizeof(t), "%s/module/%u/in", cfg->topic_prefix, mods[mi].position);
             mqtt_publish(&m.cli, t, raw, n, cfg->retain);
@@ -263,6 +497,12 @@ static void publish_state(void)
     if (cfg->stats_s > 0 && (m.full || now >= m.next_stats_ms)) {
         pub_stats(&st);
         m.next_stats_ms = now + (int64_t)cfg->stats_s * 1000;
+    }
+    if (serial_enabled())
+        publish_serial(now);
+    if (cfg->watchdog_s > 0 && (m.full || m.wd_pub != m.wd_expired)) {
+        pub("watchdog", m.wd_expired ? "expired" : "ok", 1);
+        m.wd_pub = m.wd_expired;
     }
     m.full = 0;
 }
@@ -316,6 +556,54 @@ static int parse_value(io_kind_t k, const char *s, size_t len, int allow_null, i
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Write watchdog (MQTT_WATCHDOG_S): the controlling side writes or sends
+// <prefix>/watchdog/set at least every N s; otherwise all outputs go to 0.
+// ---------------------------------------------------------------------------
+static void watchdog_kick(void)
+{
+    m.wd_last_ms = mqtt_now_ms();
+    m.wd_armed = 1;
+    if (m.wd_expired) {
+        m.wd_expired = 0;
+        LOG_INFO("write watchdog: commands again, outputs are written again");
+    }
+}
+
+// Safe state: every DO/AO 0 and the raw output bytes of complex modules 0.
+static void safe_state(void)
+{
+    static int32_t zeros32[GW_MAX_CHANNELS];
+    static uint8_t zeros8[256];
+    const int32_t *v[IO_KIND_COUNT] = { 0 };
+    size_t n[IO_KIND_COUNT] = { 0 };
+    v[IO_DO] = v[IO_AO] = zeros32;
+    n[IO_DO] = gateway_channel_count(IO_DO);
+    n[IO_AO] = gateway_channel_count(IO_AO);
+    gateway_write_multi(v, n, NULL);
+    size_t nmod = 0;
+    const kbus_module_t *mods = gateway_modules(&nmod);
+    for (size_t mi = 0; mi < nmod; ++mi) {
+        const size_t len = (mods[mi].out_size_bits + 7) / 8;
+        if (is_stepper(&mods[mi]))
+            stepper_safe(mi);                           // controlled stop, not Enable 0
+        else if (!gateway_module_has_channels(mi) && len && len <= sizeof(zeros8))
+            gateway_module_output(mi, zeros8, len);
+    }
+}
+
+static void watchdog_check(int64_t now)
+{
+    if (m.cfg->watchdog_s <= 0 || !m.wd_armed || m.wd_expired)
+        return;
+    if (now - m.wd_last_ms < (int64_t)m.cfg->watchdog_s * 1000)
+        return;
+    safe_state();
+    m.wd_expired = 1;
+    LOG_WARN("write watchdog: no write and no watchdog/set for %d s: all outputs switched to 0",
+             m.cfg->watchdog_s);
+}
+
 static void write_outputs(const char *t, io_kind_t k, const int32_t *vals, size_t n)
 {
     const int32_t *v[IO_KIND_COUNT] = { 0 };
@@ -334,6 +622,7 @@ static void write_outputs(const char *t, io_kind_t k, const int32_t *vals, size_
         reply_error(t, "value out of range");
         return;
     }
+    watchdog_kick();
     if (changed && m.cfg->mqtt_log >= 1) {
         char line[160];
         size_t b = 0;
@@ -450,6 +739,10 @@ static void on_module_out(const char *t, const char *pos_s, const char *p, size_
         reply_error(t, "module has channels: use do/ao instead");
         return;
     }
+    if (is_stepper(&mods[mi])) {
+        reply_error(t, "module has a driver: use module/<pos>/stepper/cmd/set");
+        return;
+    }
     const int r = gateway_module_output(mi, (const uint8_t *)p, len);
     if (r == GW_ERANGE) {
         char e[96];
@@ -457,8 +750,232 @@ static void on_module_out(const char *t, const char *pos_s, const char *p, size_
         reply_error(t, e);
     } else if (r != GW_OK) {
         reply_error(t, "module has no output data");
-    } else if (m.cfg->mqtt_log >= 2) {
-        LOG_INFO("write module %lu: %zu bytes (%s)", pos, len, t);
+    } else {
+        watchdog_kick();
+        if (m.cfg->mqtt_log >= 2)
+            LOG_INFO("write module %lu: %zu bytes (%s)", pos, len, t);
+    }
+}
+
+// A retained module topic of an earlier run (rest after "module/"): stale when the module
+// at that position does not have it now (another node after a restart).
+static int module_topic_stale(const char *rest)
+{
+    char *end = NULL;
+    const unsigned long pos = strtoul(rest, &end, 10);
+    if (end == rest || *end != '/')
+        return 0;                                       // not ours: leave it
+    const char *what = end + 1;
+    size_t nmod = 0, mi;
+    const kbus_module_t *mods = gateway_modules(&nmod);
+    for (mi = 0; mi < nmod && mods[mi].position != pos; ++mi)
+        ;
+    if (mi == nmod)
+        return 1;                                       // no module at this position now
+    const kbus_module_t *mod = &mods[mi];
+    if (strcmp(what, "in") == 0)
+        return gateway_module_has_channels(mi) || !mod->in_size_bits;
+    if (strcmp(what, "stepper/state") == 0 || strcmp(what, "stepper/response") == 0)
+        return !is_stepper(mod);
+    const module_desc_t *d = module_desc(mod->type);
+    const size_t fl = d ? strlen(d->function) : 0;
+    if (d && strncmp(what, d->function, fl) == 0 && what[fl] == '/') {
+        const unsigned long n = strtoul(what + fl + 1, &end, 10);
+        size_t count = 0;                               // the module's AI channels
+        for (size_t c = 1; c <= gateway_channel_count(IO_AI); ++c)
+            if (gateway_channel(IO_AI, c)->module_index == mi)
+                ++count;
+        return *end != '\0' || n == 0 || n > count;
+    }
+    return strstr(what, "/set") == NULL;                // other function topics of this position: stale
+}
+
+// <prefix>/module/<pos>/reg/get {"table":0,"register":6,"id":"x"}: read ONE register of the
+// module (register communication, read only). Answered on module/<pos>/reg/value.
+static void on_reg_get(const char *t, const char *pos_s, const char *p, size_t len)
+{
+    char *end = NULL;
+    const unsigned long pos = strtoul(pos_s, &end, 10);
+    if (end == pos_s || *end != '/' || pos == 0 || pos > 255)
+        return;
+    char j[256], id[REGCOM_ID_MAX] = "", sid[64];
+    long table = -1, reg = -1, num;
+    int present = 0;
+    const char *err = NULL;
+    if (len >= sizeof(j)) {
+        err = "request too long";
+    } else {
+        memcpy(j, p, len);
+        j[len] = '\0';
+        const char *idv = json_value(j, "id");
+        if (idv && *idv == '"') {
+            if (json_str(j, "id", sid, sizeof(sid)) != 0)
+                err = "id must be a short string without escapes";
+            else
+                snprintf(id, sizeof(id), "\"%s\"", sid);
+        } else if (idv) {
+            if (json_num(j, "id", &num, &present) != 0)
+                err = "id must be a string or an integer";
+            else
+                snprintf(id, sizeof(id), "%ld", num);
+        }
+        if (!err && (json_num(j, "table", &num, &present) != 0 || !present || num < 0 || num > 255))
+            err = "expected \\\"table\\\": 0..255";
+        else if (!err)
+            table = num;
+        if (!err && (json_num(j, "register", &num, &present) != 0 || !present || num < 0 || num > 63))
+            err = "expected \\\"register\\\": 0..63";
+        else if (!err)
+            reg = num;
+    }
+    size_t nmod = 0, mi;
+    const kbus_module_t *mods = gateway_modules(&nmod);
+    for (mi = 0; mi < nmod && mods[mi].position != pos; ++mi)
+        ;
+    if (!err && mi == nmod)
+        err = "no module at this position";
+    if (!err && (mods[mi].type & 0x8000u))
+        err = "digital module: no registers";
+    if (!err) {
+        const int r = regcom_request((uint16_t)pos, (uint16_t)table, (uint16_t)reg, id);
+        if (r == 0)
+            return;                                     // answered by publish_reg_results()
+        err = r == -1 ? "busy: too many requests" : "register access not available";
+    }
+    if (m.cfg->mqtt_log >= 1)
+        LOG_WARN("rejected %s: %s", t, err);
+    reg_reply(pos, table, reg, 0, 0, err, id);
+}
+
+// ---------------------------------------------------------------------------
+// 750-671 stepper drivers (stepper.c)
+// ---------------------------------------------------------------------------
+static void stepper_pub(uint16_t pos, const char *what, const char *payload, int retain)
+{
+    if (!mqtt_connected(&m.cli) || m.state != ST_RUN)
+        return;
+    char t[96];
+    snprintf(t, sizeof(t), "module/%u/%s", pos, what);
+    pub(t, payload, retain);
+    if (retain && pos < sizeof(m.stp_pub))
+        m.stp_pub[pos] = 1;
+}
+
+// Every tick, also without a broker connection: the handshakes go on.
+static void steppers_tick(int64_t now)
+{
+    size_t nmod = 0;
+    const kbus_module_t *mods = gateway_modules(&nmod);
+    const int full = m.full && mqtt_connected(&m.cli) && m.state == ST_RUN;
+    for (size_t mi = 0; mi < nmod; ++mi)
+        if (is_stepper(&mods[mi]))
+            stepper_tick(mi, mods[mi].position, now, full, stepper_pub);
+}
+
+// <prefix>/module/<pos>/stepper/cmd/set
+static void on_stepper(const char *t, const char *pos_s, const char *p, size_t len)
+{
+    char *end = NULL;
+    const unsigned long pos = strtoul(pos_s, &end, 10);
+    size_t nmod = 0, mi;
+    const kbus_module_t *mods = gateway_modules(&nmod);
+    for (mi = 0; mi < nmod && !(end != pos_s && *end == '/' && mods[mi].position == pos); ++mi)
+        ;
+    if (mi == nmod || !is_stepper(&mods[mi])) {
+        reply_error(t, "no 750-671 stepper at this position");
+        return;
+    }
+    char err[200];
+    if (stepper_command(mi, (uint16_t)pos, p, len, err, sizeof(err)) != 0) {
+        reply_error(t, err);
+        return;
+    }
+    watchdog_kick();
+    if (m.cfg->mqtt_log >= 1)
+        LOG_INFO("stepper %lu: %.*s (%s)", pos, (int)(len > 160 ? 160 : len), p, t);
+}
+
+// <prefix>/serial/com1/...: during the cleanup the retained topics of an earlier run
+// (removed when COM1 is off now); afterwards the .../set commands.
+static void on_serial(const char *t, const char *sub, const char *p, size_t len, int retained)
+{
+    if (m.state == ST_CLEANUP) {
+        if (retained && len > 0 && !serial_enabled() && strncmp(sub, "com1/", 5) == 0 && !strchr(sub + 5, '/')) {
+            LOG_INFO("removing old retained topic %s (COM1 off)", t);
+            delete_topic(t);
+        }
+        return;
+    }
+    char what[16];
+    if (sscanf(sub, "com1/%15[^/]", what) != 1 || strlen(sub) != 5 + strlen(what) + 4 ||
+        strcmp(sub + 5 + strlen(what), "/set") != 0)
+        return;
+    if (retained) {
+        if (!m.warned_retained_set++)
+            LOG_WARN("ignoring retained command %s: publish .../set messages WITHOUT the retain flag "
+                     "(delete it with: mosquitto_pub -r -n -t '%s')", t, t);
+        return;
+    }
+    if (!serial_enabled()) {
+        reply_error(t, "COM1 is off (SERIAL_DEVICE is empty)");
+        return;
+    }
+    if (strcmp(what, "tx") == 0) {
+        if (len == 0 || len > SERIAL_BUF) {
+            reply_error(t, "expected 1..512 bytes (binary)");
+            return;
+        }
+        if (serial_write((const uint8_t *)p, len) != 0) {
+            serial_snapshot_t s;
+            serial_snapshot(&s);
+            reply_error(t, s.open ? "COM1 write failed" : "COM1 is not open");
+            return;
+        }
+        if (m.cfg->mqtt_log >= 2)
+            LOG_INFO("COM1 sent %zu bytes (%s)", len, t);
+        return;
+    }
+    serial_snapshot_t cur;
+    serial_snapshot(&cur);
+    char tok[16];
+    const int ok_tok = token(p, len, tok, sizeof(tok)) == 0;
+    char *end = NULL;
+    const long v = ok_tok ? strtol(tok, &end, 10) : 0;
+    const int num_ok = ok_tok && end != tok && *end == '\0';
+    if (strcmp(what, "baudrate") == 0) {
+        if (!num_ok || serial_valid_baud(v) != 0) {
+            reply_error(t, "expected a baud rate: 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400");
+            return;
+        }
+        if ((uint32_t)v != cur.baud) {
+            serial_configure((uint32_t)v, NULL, 0);
+            config_store_serial(m.cfg, (int)v, NULL, 0);
+            LOG_INFO("COM1 baud rate %u -> %ld (%s)", (unsigned)cur.baud, v, t);
+        }
+    } else if (strcmp(what, "format") == 0) {
+        for (char *c = tok; ok_tok && *c; ++c)
+            *c = (char)toupper((unsigned char)*c);
+        if (!ok_tok || serial_valid_format(tok, strlen(tok)) != 0) {
+            reply_error(t, "expected a format like 8E1: data bits 5..8, parity N/E/O, stop bits 1/2");
+            return;
+        }
+        if (strcmp(tok, cur.format) != 0) {
+            serial_configure(0, tok, 0);
+            config_store_serial(m.cfg, 0, tok, 0);
+            LOG_INFO("COM1 format %s -> %s (%s)", cur.format, tok, t);
+        }
+    } else if (strcmp(what, "framegap") == 0) {
+        if (!num_ok || v < 1 || v > 1000) {
+            reply_error(t, "expected a frame gap of 1..1000 ms");
+            return;
+        }
+        if ((uint32_t)v != cur.frame_gap_ms) {
+            serial_configure(0, NULL, (uint32_t)v);
+            config_store_serial(m.cfg, 0, NULL, (int)v);
+            LOG_INFO("COM1 frame gap %u -> %ld ms (%s)", (unsigned)cur.frame_gap_ms, v, t);
+        }
+    } else {
+        reply_error(t, "unknown COM1 command (tx, baudrate, format, framegap)");
     }
 }
 
@@ -472,6 +989,50 @@ static void on_message(void *ctx, const char *t, const char *p, size_t len, int 
     if (m.cfg->mqtt_log >= 2)
         LOG_INFO("message %s%s = %.*s", t, retained ? " (retained)" : "", (int)(len > 200 ? 200 : len), p);
 
+    if (m.state == ST_CLEANUP && strncmp(rest, "module/", 7) == 0) {
+        if (retained && len > 0 && module_topic_stale(rest + 7)) {
+            LOG_INFO("removing old retained topic %s", t);
+            delete_topic(t);
+        }
+        return;
+    }
+    if (strncmp(rest, "module/", 7) == 0) {
+        const size_t rl = strlen(rest);
+        if (rl > 15 && strcmp(rest + rl - 8, "/reg/get") == 0) {                  // module/<pos>/reg/get
+            if (m.state != ST_RUN)
+                return;
+            if (retained) {
+                if (!m.warned_retained_set++)
+                    LOG_WARN("ignoring retained request %s: publish it WITHOUT the retain flag "
+                             "(delete it with: mosquitto_pub -r -n -t '%s')", t, t);
+                return;
+            }
+            on_reg_get(t, rest + 7, p, len);
+            return;
+        }
+        if (rl > 23 && strcmp(rest + rl - 16, "/stepper/cmd/set") == 0) {          // module/<pos>/stepper/cmd/set
+            if (m.state != ST_RUN)
+                return;
+            if (retained) {
+                if (!m.warned_retained_set++)
+                    LOG_WARN("ignoring retained command %s: publish .../set messages WITHOUT the retain flag "
+                             "(delete it with: mosquitto_pub -r -n -t '%s')", t, t);
+                return;
+            }
+            on_stepper(t, rest + 7, p, len);
+            return;
+        }
+    }
+    if (strcmp(rest, "watchdog/set") == 0) {          // heartbeat of the controlling side
+        if (m.state == ST_RUN && !retained)
+            watchdog_kick();
+        return;
+    }
+    if (strncmp(rest, "serial/", 7) == 0) {         // before the generic parse: baudrate/set is too long for it
+        on_serial(t, rest + 7, p, len, retained);
+        return;
+    }
+
     char a[16], b[24], c[8];
     a[0] = b[0] = c[0] = '\0';
     const int parts = sscanf(rest, "%15[^/]/%23[^/]/%7s", a, b, c);
@@ -479,6 +1040,19 @@ static void on_message(void *ctx, const char *t, const char *p, size_t len, int 
     const int is_io = parts >= 2 && io_kind_parse(a, &k) == 0;
 
     if (m.state == ST_CLEANUP) {
+        if (retained && len > 0 && is_io && k == IO_AI && parts == 3 && strcmp(c, "status") == 0) {
+            // ai/<n>/status of an earlier run: removed now when the channel does not exist,
+            // else as soon as its module turns out to have no register access
+            char *end = NULL;
+            const unsigned long n = strtoul(b, &end, 10);
+            if (end == b || *end != '\0' || n == 0 || n > gateway_channel_count(IO_AI)) {
+                LOG_INFO("removing old retained topic %s", t);
+                delete_topic(t);
+            } else {
+                m.st_seen[n - 1] = 1;
+            }
+            return;
+        }
         // Retained channel topics from an earlier run: remove those of channels that do not exist now.
         if (!retained || len == 0 || !is_io || parts != 2)
             return;
@@ -521,17 +1095,33 @@ static void on_message(void *ctx, const char *t, const char *p, size_t len, int 
 // ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------
+// The retained topics of an earlier run that are checked after connecting: the channel
+// topics (removed when the channel does not exist now) and the COM1 topics (removed when
+// COM1 is off now).
+#define CLEANUP_FILTERS (IO_KIND_COUNT + 4)
+static void cleanup_filters(const char **f, char fb[][160])
+{
+    for (int k = 0; k < IO_KIND_COUNT; ++k) {
+        snprintf(fb[k], 160, "%s/%s/+", m.cfg->topic_prefix, cls[k]);
+        f[k] = fb[k];
+    }
+    snprintf(fb[IO_KIND_COUNT], 160, "%s/serial/com1/+", m.cfg->topic_prefix);
+    f[IO_KIND_COUNT] = fb[IO_KIND_COUNT];
+    snprintf(fb[IO_KIND_COUNT + 1], 160, "%s/module/+/in", m.cfg->topic_prefix);         // raw inputs
+    f[IO_KIND_COUNT + 1] = fb[IO_KIND_COUNT + 1];
+    snprintf(fb[IO_KIND_COUNT + 2], 160, "%s/module/+/+/+", m.cfg->topic_prefix);        // temperature/<n>, stepper/state
+    f[IO_KIND_COUNT + 2] = fb[IO_KIND_COUNT + 2];
+    snprintf(fb[IO_KIND_COUNT + 3], 160, "%s/ai/+/status", m.cfg->topic_prefix);         // AI status register
+    f[IO_KIND_COUNT + 3] = fb[IO_KIND_COUNT + 3];
+}
+
 static int start_session(void)
 {
     pub("status", "online", 1);
-    // Collect the retained channel topics of an earlier run (removed when stale).
-    const char *f[IO_KIND_COUNT];
-    char fb[IO_KIND_COUNT][160];
-    for (int k = 0; k < IO_KIND_COUNT; ++k) {
-        snprintf(fb[k], sizeof(fb[k]), "%s/%s/+", m.cfg->topic_prefix, cls[k]);
-        f[k] = fb[k];
-    }
-    if (mqtt_subscribe(&m.cli, f, IO_KIND_COUNT) != 0)
+    const char *f[CLEANUP_FILTERS];
+    char fb[CLEANUP_FILTERS][160];
+    cleanup_filters(f, fb);
+    if (mqtt_subscribe(&m.cli, f, CLEANUP_FILTERS) != 0)
         return -1;
     m.state = ST_CLEANUP;
     m.cleanup_until = 0;
@@ -540,13 +1130,10 @@ static int start_session(void)
 
 static int finish_cleanup(void)
 {
-    const char *f[IO_KIND_COUNT];
-    char fb[IO_KIND_COUNT][160];
-    for (int k = 0; k < IO_KIND_COUNT; ++k) {
-        snprintf(fb[k], sizeof(fb[k]), "%s/%s/+", m.cfg->topic_prefix, cls[k]);
-        f[k] = fb[k];
-    }
-    if (mqtt_unsubscribe(&m.cli, f, IO_KIND_COUNT) != 0)
+    const char *f[CLEANUP_FILTERS];
+    char fb[CLEANUP_FILTERS][160];
+    cleanup_filters(f, fb);
+    if (mqtt_unsubscribe(&m.cli, f, CLEANUP_FILTERS) != 0)
         return -1;
     if (m.cfg->write_enable) {
         char s0[160], s1[160], s2[160];
@@ -555,10 +1142,36 @@ static int finish_cleanup(void)
         snprintf(s2, sizeof(s2), "%s/bus/+/set", m.cfg->topic_prefix);
         char s3[160];
         snprintf(s3, sizeof(s3), "%s/module/+/out/set", m.cfg->topic_prefix);
-        const char *sf[4] = { s0, s1, s2, s3 };
-        if (mqtt_subscribe(&m.cli, sf, 4) != 0)
+        char s4[160], s5[160], s6[160];
+        snprintf(s6, sizeof(s6), "%s/module/+/stepper/cmd/set", m.cfg->topic_prefix);
+        snprintf(s4, sizeof(s4), "%s/serial/com1/+/set", m.cfg->topic_prefix);
+        snprintf(s5, sizeof(s5), "%s/watchdog/set", m.cfg->topic_prefix);
+        const char *sf[7] = { s0, s1, s2, s3, s6, 0, 0 };
+        size_t nf = 5;
+        if (serial_enabled())
+            sf[nf++] = s4;
+        if (m.cfg->watchdog_s > 0)
+            sf[nf++] = s5;
+        if (mqtt_subscribe(&m.cli, sf, nf) != 0)
             return -1;
     }
+    {   // register reads: read only, so also with MQTT_WRITE_ENABLE=0
+        char r0[160];
+        snprintf(r0, sizeof(r0), "%s/module/+/reg/get", m.cfg->topic_prefix);
+        const char *rf[1] = { r0 };
+        if (mqtt_subscribe(&m.cli, rf, 1) != 0)
+            return -1;
+    }
+    regcom_drop_results();                             // answers to requests of the lost connection
+    // Frames received while there was no broker connection are old: not published.
+    uint8_t frame[SERIAL_BUF];
+    size_t old = 0;
+    while (serial_pop_frame(frame) > 0)
+        ++old;
+    if (old)
+        LOG_INFO("COM1: %zu frames received while offline discarded", old);
+    m.ser_valid = 0;
+    m.wd_pub = -1;
     m.state = ST_RUN;
     m.layout = 1;
     m.full = 1;
@@ -573,6 +1186,7 @@ int mqtt_io_run(const gw_config_t *cfg, volatile sig_atomic_t *stop)
     m.cfg = cfg;
     mqtt_init(&m.cli, on_message, NULL);
     m.version_seen = gateway_config_version();
+    regcom_layout();
 
     if (cfg->mqtt_priority > 0) {
         struct sched_param sp = { .sched_priority = cfg->mqtt_priority };
@@ -640,8 +1254,12 @@ int mqtt_io_run(const gw_config_t *cfg, volatile sig_atomic_t *stop)
         if (ver != m.version_seen) {
             m.version_seen = ver;
             m.layout = 1;
+            stepper_reset_all();                       // before the next stepper tick
+            regcom_layout();                           // new AI channel list for the status reads
         }
 
+        watchdog_check(now);                           // also while the broker is away
+        steppers_tick(now);
         if (!mqtt_connected(&m.cli))
             continue;
         if (m.state == ST_CLEANUP) {

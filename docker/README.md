@@ -11,6 +11,8 @@ it back.
 
 ```
  other brokers ──▶ mqtt-bridge ──┐
+ SCADA ─IEC 104─▶ mqtt-iec104 ──┤
+ Modbus TCP ◀──▶ mqtt-modbus ───┤
                                  ├──▶ kbus-mosquitto :1883 ◀── CODESYS, Node-RED, your containers
  KBUS ◀─────────▶ kbus-gateway ─────┘         :9001 (WebSocket, read only, 127.0.0.1)
                   (gateway/: container,        ▲
@@ -23,11 +25,13 @@ it back.
 | [gateway/](gateway/) | `kbus-gateway:<version>-<arch>` | owns the KBUS, publishes it on MQTT, writes outputs from `.../set` | one kbus-gateway: this container **or** the native package (`tools/build-ipk.sh`) |
 | [mosquitto/](mosquitto/) | `kbus-mosquitto:<arch>` | the broker, configuration built in ([mosquitto.conf](mosquitto/mosquitto.conf)) | when mosquitto is not installed otherwise |
 | [mqtt-bridge/](mqtt-bridge/README.md) | `mqtt-bridge:<arch>` | subscribes on other brokers, publishes on the PFC broker | optional |
+| [mqtt-iec104/](mqtt-iec104/README.md) | `mqtt-iec104:<arch>` | IEC 60870-5-104 server (TCP 2404) ⇄ MQTT, mapping in a YAML file (arm64 only) | optional |
+| [mqtt-modbus/](mqtt-modbus/README.md) | `mqtt-modbus:<arch>` | Modbus TCP client: polls devices, publishes their values, writes from `/set` topics; YAML configuration | optional |
 | [mqtt-manager/](mqtt-manager/) | `mqtt-manager:<arch>` | KBUS Manager page at `http(s)://<pfc>/kbus` (WBM layout, login), keeps `/kbus` linked in the WAGO web server | optional |
 
 **Build context:** `gateway/` and `mqtt-manager/` build from the project root
 (`src/` + `sdk/`, `web/`; ignore files `<folder>/Dockerfile.dockerignore`),
-`mosquitto/` and `mqtt-bridge/` from their own folder.
+`mosquitto/`, `mqtt-bridge/`, `mqtt-iec104/` and `mqtt-modbus/` from their own folder.
 
 ## Build and deploy
 
@@ -41,6 +45,8 @@ tools/deploy-docker.sh 192.168.1.17 --sim                         # the same in 
 tools/deploy-docker.sh 192.168.1.17 --mosquitto --no-gateway      # only the broker
 tools/deploy-docker.sh 192.168.1.17 --bridge --no-gateway         # only the mqtt-bridge
 tools/deploy-docker.sh 192.168.1.17 --manager --no-gateway        # only the KBUS Manager page
+tools/deploy-docker.sh 192.168.1.17 --iec104 --no-gateway         # only the IEC 104 gateway
+tools/deploy-docker.sh 192.168.1.17 --modbus --no-gateway         # only the Modbus bridge
 tools/deploy-docker.sh 192.168.1.17 --mosquitto --bridge --manager   # everything
 SKIP_BUILD=1 tools/deploy-docker.sh ...                            # reuse the archives in build-docker/
 tools/deploy-docker.sh 192.168.1.17 --native                      # kbus-gateway container -> native service again
@@ -49,11 +55,13 @@ tools/deploy-docker.sh 192.168.1.17 --native                      # kbus-gateway
 By hand, from the project root:
 
 ```bash
-docker buildx build --platform linux/arm64 -f docker/gateway/Dockerfile -t kbus-gateway:3.0.0-arm64 --load .
+docker buildx build --platform linux/arm64 -f docker/gateway/Dockerfile -t kbus-gateway:$(cat VERSION)-arm64 --load .
 docker buildx build --platform linux/arm64 -t kbus-mosquitto:arm64 --load docker/mosquitto
 docker buildx build --platform linux/arm64 -t mqtt-bridge:arm64 --load docker/mqtt-bridge
 docker buildx build --platform linux/arm64 -f docker/mqtt-manager/Dockerfile -t mqtt-manager:arm64 --load .
+docker buildx build --platform linux/arm64 -t mqtt-iec104:arm64 --load docker/mqtt-iec104
+docker buildx build --platform linux/arm64 -t mqtt-modbus:arm64 --load docker/mqtt-modbus
 ```
 
-Details: main [README](../README.md) 2.2 (broker), 2.8 (kbus-gateway container),
-3.7 (KBUS Manager page), 4 (mqtt-bridge).
+Details: [docs/MANUAL.md](../docs/MANUAL.md) 2.2 (broker), 2.8 (kbus-gateway
+container), 6 (KBUS Manager page), 7.1 (mqtt-bridge), 7.2 (mqtt-iec104), 7.3 (mqtt-modbus).

@@ -12,6 +12,16 @@
 //   <prefix>/module/<pos>/out/set      raw output bytes for it (binary, exactly its output size)
 //   <prefix>/bus/healthy|cycletime|configversion|statistics
 //   <prefix>/bus/cycletime/set, bus/rescan/set, bus/resetstatistics/set
+//   <prefix>/serial/com1/open|baudrate|format|framegap|statistics   COM1 state and settings (retained)
+//   <prefix>/serial/com1/rx            one message per received frame (binary, not retained)
+//   <prefix>/serial/com1/tx/set        bytes to send (binary, 1..512)
+//   <prefix>/serial/com1/baudrate/set, format/set, framegap/set     COM1 settings (stored)
+//   <prefix>/module/<pos>/<function>/<n>  scaled value of a module with a descriptor (750-450 temperature)
+//   <prefix>/watchdog, watchdog/set    write watchdog state / heartbeat (MQTT_WATCHDOG_S)
+//   <prefix>/module/<pos>/stepper/state|response, stepper/cmd/set   750-671 driver (stepper.h)
+//   <prefix>/ai/<n>/status             register 6 of the channel (status), retained (regcom.h)
+//   <prefix>/module/<pos>/reg/get      read one register: {"table":0,"register":6,"id":"x"} (read only)
+//   <prefix>/module/<pos>/reg/value    answer: {"table":0,"register":6,"value":96,"ok":true,"id":"x"}
 //   <prefix>/error                     rejected writes (not retained)
 #ifndef KBUS_GW_MQTT_IO_H
 #define KBUS_GW_MQTT_IO_H

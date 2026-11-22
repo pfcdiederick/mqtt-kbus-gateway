@@ -1,0 +1,98 @@
+# mqtt-modbus: Modbus TCP devices <-> MQTT
+#
+# On the controller: /home/mqtt-modbus/mqtt-modbus.yaml (created from this file at the
+# first deployment, then kept). After a change: docker restart mqtt-modbus
+# Check a file without starting: docker run --rm -v /home/mqtt-modbus:/config:ro mqtt-modbus:arm64 --check
+#
+# Topics per device (topic default modbus/<name>):
+#   <topic>/<tag>        value, published on change (retained)
+#   <topic>/<tag>/set    write (tags with write: true), publish WITHOUT retain
+#   <topic>/status       online / offline: device reachable (retained)
+#   modbus/status        the bridge itself: online / offline (retained, last will)
+#   modbus/error         rejected or failed writes (not retained)
+
+general:
+  log_level: INFO          # DEBUG shows every published value
+  payload: plain           # plain = 31.25 / true;  json = {"value": 31.25, "unit": "kW", "timestamp": ...}
+  republish_s: 0           # also publish unchanged values every N s; 0 = only changes
+
+mqtt:
+  host: 127.0.0.1          # the broker on the PFC
+  port: 1883
+  client_id: ""            # "" = mqtt-modbus-<hostname>
+  username: ""
+  password: ""
+  keepalive: 30
+  qos: 0
+  retain: true             # values retained: a new subscriber gets them at once
+  tls: false
+  ca_cert: ""              # file in /home/mqtt-modbus/ -> /config/<file>
+  tls_insecure: false
+  status_topic: modbus/status   # "" = no status and no error topic
+
+# One entry per Modbus TCP server (slave). Every device has its own connection and poll thread.
+#   name        unique, used in the default topic modbus/<name>
+#   host, port  Modbus TCP server (port 502)
+#   unit_id     default unit / slave id of the tags (1)
+#   interval    poll interval in s (1); 0.1 is possible for a fast device on the local network
+#   timeout     response timeout in s (3)
+#   word_order  32/64-bit values: big = high word first (ABCD), little = low word first (CDAB)
+#   byte_order  inside a register: big = standard (AB), little = swapped (BA)
+#   max_gap     tags at most this many registers apart are read in one request (10; 0 = only adjacent)
+#   topic       base topic (default modbus/<name>)
+#
+# Tags:
+#   name        topic level: <topic>/<name>; with count: {n} = 1, 2, ...
+#   table       coil (FC1, write FC5) | discrete (FC2) | holding (FC3, write FC6/FC16) | input (FC4); default holding
+#   address     0-based register / coil address (count: the next ones follow)
+#   type        bool | int16 | uint16 | int32 | uint32 | float32 | int64 | uint64 | float64
+#               (coil/discrete: bool; holding/input: default uint16)
+#   bit         0..15: one bit of a holding/input register as bool (read only)
+#   scale, offset   value = raw * scale + offset (writing: raw = (value - offset) / scale)
+#   decimals    round the published value
+#   unit        engineering unit (only in the json payload)
+#   unit_id     overrides the device's unit_id
+#   write       true = also <topic>/<name>/set (coil and holding only)
+#   min, max    refuse writes outside this range (engineering value)
+#   topic       own topic instead of <topic>/<name> (not with count)
+#   count       a series of equal tags
+devices:
+  - name: meter                         # example: energy meter
+    host: 192.168.1.50
+    port: 502
+    unit_id: 1
+    interval: 1
+    word_order: big
+    tags:
+      - name: voltage_l{n}              # voltage_l1..l3 in holding 0..5, float32
+        count: 3
+        address: 0
+        type: float32
+        unit: V
+        decimals: 1
+      - name: power
+        address: 12
+        type: int32
+        scale: 0.001                    # W -> kW
+        unit: kW
+      - name: energy
+        table: input
+        address: 100
+        type: uint64
+        scale: 0.001
+        unit: kWh
+      - name: alarm
+        address: 20
+        bit: 3                          # bit 3 of holding register 20
+      - name: setpoint                  # write: publish to modbus/meter/setpoint/set
+        address: 30
+        type: int16
+        scale: 0.1                      # 21.5 -> raw 215
+        write: true
+        min: 0
+        max: 100
+      - name: relay{n}                  # coils 0..3, write: modbus/meter/relay1/set = true
+        count: 4
+        table: coil
+        address: 0
+        write: true

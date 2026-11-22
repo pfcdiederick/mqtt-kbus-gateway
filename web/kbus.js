@@ -15,16 +15,14 @@ const enc = new TextEncoder();
 const dec = new TextDecoder("utf-8", { fatal: true });
 const WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + location.host +
   location.pathname.replace(/[^/]*$/, "") + "ws";
-const CLASSES = ["di", "do", "ai", "ao"];
 
 let PREFIX = "kbus", READONLY = false;
 
 // ---- navigation: main menu (tabs) and sub menu, like the WBM ---------------
 const MENU = [
-  { id: "status", title: "Status", pages: [["kbus", "KBUS Status"], ["modules", "Modules"]] },
-  { id: "io", title: "I/O", pages: [["process", "Process Image"]] },
+  { id: "status", title: "Status", pages: [["serial", "COM1"], ["kbus", "KBUS"], ["modules", "Modules"]] },
   { id: "mqtt", title: "MQTT", pages: [["topics", "Topics"], ["clients", "Clients"]] },
-  { id: "settings", title: "Settings", pages: [["cycle", "KBUS Cycle"], ["login", "Login"]] },
+  { id: "settings", title: "Settings", pages: [["cycle", "KBUS"], ["login", "Login"]] },
 ];
 let tab = "status", page = "kbus";
 function route() {
@@ -51,10 +49,11 @@ function led(id, color, title) {
 }
 
 // ---- state (from MQTT) ----------------------------------------------------------
-const io = { di: [], do: [], ai: [], ao: [] };      // channel values, index = n-1
 const bus = {};                                      // <prefix>/bus/<name>
 let stats = {}, modules = [], gwStatus = null;
 const bridges = {};                                  // <name> -> online|offline, "" = the bridge itself
+const ser = {};                                      // <prefix>/serial/com1/<name> (open, baudrate, ...)
+let serStats = {}, serRx = [];                       // statistics; last received frames [{time, bytes}]
 const topics = new Map();                            // topic -> {text, time}
 let layoutKey = "", dirty = false, topicsDirty = false;
 
@@ -66,19 +65,25 @@ function payloadText(p) {
 function onMessage(topic, payload) {
   const deleted = payload.length === 0;              // empty retained message = topic removed
   const text = payloadText(payload);
+  if (topic.endsWith("/set")) return;                  // a command (write), not a state: not listed
   if (deleted) topics.delete(topic); else topics.set(topic, { text, time: Date.now() });
   topicsDirty = true;
   if (topic === PREFIX + "/status") {
     gwStatus = deleted ? null : text;
   } else if (topic.startsWith(PREFIX + "/")) {
     const rest = topic.slice(PREFIX.length + 1).split("/");
-    if (CLASSES.includes(rest[0]) && rest.length === 2 && /^\d+$/.test(rest[1])) {
-      const i = Number(rest[1]) - 1;
-      if (deleted) io[rest[0]].length = Math.min(io[rest[0]].length, i);
-      else io[rest[0]][i] = rest[0][0] === "d" ? text === "true" : Number(text);
+    if (rest[0] === "watchdog" && rest.length === 1) {
+      bus.watchdog = deleted ? undefined : text;
     } else if (rest[0] === "bus" && rest.length === 2) {
       bus[rest[1]] = deleted ? undefined : text;
       if (rest[1] === "statistics") { try { stats = deleted ? {} : JSON.parse(text); } catch (e) { stats = {}; } }
+    } else if (rest[0] === "serial" && rest[1] === "com1" && rest.length === 3) {
+      if (rest[2] === "rx") {
+        if (!deleted) { serRx.unshift({ time: Date.now(), bytes: payload }); serRx.length = Math.min(serRx.length, 10); }
+      } else {
+        ser[rest[2]] = deleted ? undefined : text;
+        if (rest[2] === "statistics") { try { serStats = deleted ? {} : JSON.parse(text); } catch (e) { serStats = {}; } }
+      }
     } else if (rest[0] === "modules" && rest.length === 1) {
       try { modules = deleted ? [] : JSON.parse(text); } catch (e) { modules = []; }
     } else if (rest[0] === "error" && rest.length === 1 && !deleted) {
@@ -125,24 +130,39 @@ function render() {
     ? `Cycle ${bus.cycletime ?? "–"} ms · ${stats.cycles ?? "–"} cycles · ${stats.errors ?? "–"} errors`
     : connected ? "kbus-gateway " + (gwStatus || "not seen") : "";
 
-  const key = CLASSES.map(channelCount).join(",") + "|" + bus.configversion + "|" + JSON.stringify(modules);
-  if (key !== layoutKey) { layoutKey = key; renderModules(); buildIO(); }
-  renderIO();
+  const key = bus.configversion + "|" + JSON.stringify(modules);
+  if (key !== layoutKey) { layoutKey = key; renderModules(); }
+  const wd = $("st-watchdog"), w = bus.watchdog;
+  wd.className = "control " + (w === "ok" ? "ok-text" : w === "expired" ? "bad-text" : "");
+  wd.textContent = w === undefined ? "off" : w === "ok" ? "ok" : "expired: no write for MQTT_WATCHDOG_S, outputs are 0";
+  renderSerial();
   if (page === "topics" && topicsDirty) renderTopics(false);
 }
 
-function channelCount(cls) {
-  let n = 0;
-  for (const m of modules) n += (m.channels && m.channels[cls] ? m.channels[cls].length : 0);
-  return n || io[cls].length;
+// ---- COM1 ----------------------------------------------------------------------------
+// bytes -> readable: printable ASCII as is, every other byte as <XX>
+const showBytes = b => [...b].map(x => x >= 0x20 && x < 0x7f ? String.fromCharCode(x)
+  : "<" + x.toString(16).toUpperCase().padStart(2, "0") + ">").join("");
+function renderSerial() {
+  const on = ser.open !== undefined;
+  $("ser-off").style.display = on ? "none" : "";
+  $("ser-form").style.display = $("ser-mon").style.display = on ? "" : "none";
+  if (!on) return;
+  const open = ser.open === "true";
+  $("ser-open").className = "control " + (open ? "ok-text" : "bad-text");
+  $("ser-open").textContent = open ? "open" : "not open (device missing, or used by another program)";
+  const f = ser.format || "", parity = { N: "none", E: "even", O: "odd" }[f[1]] || "?";
+  $("ser-baud").textContent = ser.baudrate ? ser.baudrate + " baud" : "–";
+  $("ser-format").textContent = f ? `${f}  (${f[0]} data bits, parity ${parity}, ${f[2]} stop bit${f[2] === "2" ? "s" : ""})` : "–";
+  $("ser-gap").textContent = ser.framegap ? ser.framegap + " ms" : "–";
+  const s = serStats;
+  $("ser-counts").textContent = s.txBytes != null ? `${s.txBytes} / ${s.rxBytes} bytes` : "–";
+  $("ser-frames").textContent = s.frames != null ? `${s.frames} / ${s.dropped} / ${s.errors}` : "–";
+  $("ser-rx").innerHTML = serRx.map(r => `<tr><td>${esc(new Date(r.time).toLocaleTimeString())}</td><td>${r.bytes.length}</td>`
+    + `<td class="mono bytes">${esc(showBytes(r.bytes))}</td></tr>`).join("")
+    || `<tr><td colspan="3">Nothing received since the page was opened.</td></tr>`;
 }
-function where(cls, n) {
-  for (const m of modules) {
-    const l = m.channels && m.channels[cls];
-    if (l && l.includes(n)) return `module ${m.position}, channel ${l.indexOf(n) + 1}`;
-  }
-  return "";
-}
+
 function renderModules() {
   $("modules").innerHTML = modules.map(m => {
     const ch = Object.entries(m.channels || {})
@@ -150,35 +170,6 @@ function renderModules() {
     return `<tr><td>${esc(m.position)}</td><td>${esc(m.name)}</td><td>${esc(m.typeCode)}</td><td>${esc(ch || "no channels")}</td></tr>`;
   }).join("") || `<tr><td colspan="4">${gwStatus ? "No modules on the KBUS." : "Waiting for kbus-gateway …"}</td></tr>`;
 }
-function buildIO() {
-  const n = c => channelCount(c), none = '<span class="none">none</span>';
-  $("io-di").innerHTML = [...Array(n("di"))].map((_, i) =>
-    `<div class="io-item" title="${where("di", i + 1)}">DI${i + 1}<div class="lamp" id="di-${i}"></div></div>`).join("") || none;
-  $("io-do").innerHTML = [...Array(n("do"))].map((_, i) =>
-    `<div class="io-item" title="${where("do", i + 1)}">DO${i + 1}<div class="lamp" id="do-${i}"></div>`
-    + `<button class="w" data-do="${i + 1}" id="dob-${i}">OFF</button></div>`).join("") || none;
-  $("io-ai").innerHTML = [...Array(n("ai"))].map((_, i) =>
-    `<span title="${where("ai", i + 1)}">AI${i + 1}</span><div class="bar"><div id="aib-${i}"></div></div><span class="num" id="ai-${i}">–</span>`).join("") || none;
-  $("io-ao").innerHTML = [...Array(n("ao"))].map((_, i) =>
-    `<span title="${where("ao", i + 1)}">AO${i + 1}</span><div class="aorow"><div class="bar"><div id="aob-${i}"></div></div>`
-    + `<input type="number" min="0" max="65535" id="aoi-${i}"><button class="w small" data-ao="${i + 1}">Set</button></div>`
-    + `<span class="num" id="ao-${i}">–</span>`).join("") || none;
-  applyWrite();
-}
-function renderIO() {
-  io.di.forEach((x, i) => { const l = $("di-" + i); if (l) l.classList.toggle("on", x); });
-  io.do.forEach((x, i) => {
-    const l = $("do-" + i), b = $("dob-" + i);
-    if (l) l.classList.toggle("on", x);
-    if (b) { b.textContent = x ? "ON" : "OFF"; b.classList.toggle("action", x); b.dataset.state = x ? "1" : "0"; }
-  });
-  for (const c of ["ai", "ao"]) io[c].forEach((x, i) => {
-    const n = $(`${c}-${i}`), b = $(`${c}b-${i}`);
-    if (n) n.textContent = x;
-    if (b) b.style.width = (x / 655.35).toFixed(1) + "%";
-  });
-}
-
 function renderTopics(full) {
   topicsDirty = false;
   const f = $("tfilter").value.trim().toLowerCase();
@@ -187,20 +178,64 @@ function renderTopics(full) {
   const tb = $("ttable");
   const existing = new Map([...tb.rows].map(r => [r.dataset.t, r]));
   if (full || existing.size !== rows.length || rows.some((t, i) => tb.rows[i].dataset.t !== t)) {
-    tb.innerHTML = rows.map(t => `<tr data-t="${esc(t)}"><td class="mono">${esc(t)}</td><td class="val mono"></td><td></td></tr>`).join("");
+    tb.innerHTML = rows.map(t => {
+      const w = control && output(t);
+      return `<tr data-t="${esc(t)}"><td class="mono">${esc(t)}</td>`
+        + `<td class="val mono${w ? " edit" : ""}"${w ? ` contenteditable="plaintext-only" spellcheck="false" title="type a new value, Enter = write, Esc = cancel"` : ""}></td><td></td></tr>`;
+    }).join("");
   }
   for (const r of tb.rows) {
     const e = topics.get(r.dataset.t);
     if (!e) continue;
     const v = r.cells[1], when = new Date(e.time).toLocaleTimeString();
-    if (v.textContent !== e.text) {
-      const first = v.textContent === "";
-      v.textContent = e.text;
-      if (!first) { v.classList.remove("flash"); void v.offsetWidth; v.classList.add("flash"); }
-    }
+    if (v.textContent !== e.text && document.activeElement !== v) v.textContent = e.text;   // not while typing
     r.cells[2].textContent = when;
   }
 }
+
+// ---- take control: the output values in the topics table become editable --------------------
+// Only when logged in (the mqtt-manager also requires the login for do/ao writes) and after
+// "Take Control"; ends on logout. kbus/do/<n> -> do/<n>/set, kbus/ao/<n> -> ao/<n>/set.
+let control = false;
+const forced = new Map();                              // "do/1" -> written under control (reset on release)
+function output(t) {
+  const m = t.startsWith(PREFIX + "/") && t.slice(PREFIX.length + 1).match(/^(do|ao)\/(\d+)$/);
+  return m ? { cls: m[1], n: Number(m[2]) } : null;
+}
+async function setControl(on) {
+  if (!on && forced.size) await releaseOutputs();
+  control = on && !!auth && !READONLY;
+  $("takectl").textContent = control ? "Release Control" : "Take Control";
+  $("takectl").classList.toggle("action", control);
+  $("ctlnote").textContent = control ? "Click a value of kbus/do/… or kbus/ao/… to change it." : "";
+  if (page === "topics") renderTopics(true);
+}
+function writeValue(cell) {
+  const t = cell.parentNode.dataset.t, o = output(t), s = cell.textContent.trim().toLowerCase();
+  let v = null;
+  if (o.cls === "do") v = ["true", "on", "1"].includes(s) ? true : ["false", "off", "0"].includes(s) ? false : null;
+  else if (/^\d+$/.test(s) && Number(s) <= 65535) v = Number(s);
+  cell.textContent = topics.get(t) ? topics.get(t).text : "";
+  if (v === null) return msg(o.cls === "do" ? "DO: true or false." : "AO: whole number 0..65535.");
+  publish(`${o.cls}/${o.n}/set`, v, `${o.cls.toUpperCase()}${o.n} = ${v}`)
+    .then(ok => { if (ok) forced.set(`${o.cls}/${o.n}`, o.cls); });
+}
+
+// Release: every output written under control goes back to false / 0 (temporary control).
+async function releaseOutputs() {
+  const list = [...forced.entries()];
+  forced.clear();
+  for (const [k, cls] of list) await publish(`${k}/set`, cls === "do" ? false : 0, "", true);
+  if (list.length) msg(`Control released: ${list.map(([k]) => k.replace("/", "").toUpperCase()).join(", ")} reset.`, true);
+}
+// Closing the page under control: reset as well (best effort, the browser may not wait).
+window.addEventListener("pagehide", () => {
+  if (!forced.size || !auth) return;
+  for (const [k, cls] of forced)
+    fetch("api/publish", { method: "POST", keepalive: true, headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ topic: `${k}/set`, value: cls === "do" ? false : 0 }) });
+  forced.clear();
+});
 
 // ---- connected clients (mqtt-manager: from the broker's log) -------------------------
 let clientList = null, clientTimer = null;
@@ -305,6 +340,7 @@ function parse() {
 let auth = null, authUser = "", settings = null;
 try { auth = sessionStorage.getItem("kbusAuth"); authUser = sessionStorage.getItem("kbusUser") || ""; } catch (e) { /* no storage */ }
 function setAuth(a, user) {
+  if (!a && control) { setControl(false).then(() => setAuth(null)); return; }   // reset the outputs first, then log out
   auth = a; authUser = user || "";
   try {
     if (a) { sessionStorage.setItem("kbusAuth", a); sessionStorage.setItem("kbusUser", authUser); }
@@ -404,14 +440,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   document.addEventListener("click", e => {
     const t = e.target.closest(".form > span.title");             // collapsible panels
     if (t) return t.parentNode.classList.toggle("collapsed");
-    const d = e.target.closest("[data-do]");
-    if (d) return publish(`do/${d.dataset.do}/set`, d.dataset.state !== "1", "", true);
-    const a = e.target.closest("[data-ao]");
-    if (a) {
-      const v = Number($("aoi-" + (a.dataset.ao - 1)).value);
-      if (!Number.isInteger(v) || v < 0 || v > 65535) return msg("Analog output: whole number 0..65535");
-      publish(`ao/${a.dataset.ao}/set`, v, `AO${a.dataset.ao} = ${v}`);
-    }
   });
   $("login-btn").addEventListener("click", loginClick);
   $("login-btn").addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); loginClick(); } });
@@ -428,12 +456,34 @@ document.addEventListener("DOMContentLoaded", async () => {
     closeLogin(true);
   });
   $("tfilter").addEventListener("input", () => renderTopics(true));
+  $("takectl").addEventListener("click", async () => {
+    if (!control && !await ensureLogin("Taking control of the outputs needs the login.")) return;
+    await setControl(!control);
+  });
+  $("ttable").addEventListener("keydown", e => {
+    const c = e.target.closest("td.edit");
+    if (!c) return;
+    if (e.key === "Enter") { e.preventDefault(); writeValue(c); c.blur(); }
+    else if (e.key === "Escape") { const d = topics.get(c.parentNode.dataset.t); c.textContent = d ? d.text : ""; c.blur(); }
+  });
+  $("ttable").addEventListener("focusout", e => {     // leaving the cell without Enter: back to the value
+    const c = e.target.closest("td.edit"), d = c && topics.get(c.parentNode.dataset.t);
+    if (d) c.textContent = d.text;
+  });
   $("cycset").addEventListener("click", () => {
     const v = Number($("cyc").value);
     if (!Number.isInteger(v) || v < 1 || v > 40) return msg("Cycle time: whole number 1..40 ms.");
     publish("bus/cycletime/set", v, `Cycle time ${v} ms`).then(ok => { if (ok) $("cyc").value = ""; });
   });
   $("reset").addEventListener("click", () => publish("bus/resetstatistics/set", true, "Reset Statistics"));
+  $("ser-send").addEventListener("click", () => {
+    const t = $("ser-tx").value.replace(/\\r/g, "\r").replace(/\\n/g, "\n")
+      .replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+    if (!t) return msg("COM1: enter something to send.");
+    if (/[^\x00-\xff]/.test(t)) return msg("COM1: only characters U+0000..U+00FF (one byte each); use \\xNN for other bytes.");
+    if (t.length > 512) return msg("COM1: at most 512 bytes.");
+    publish("serial/com1/tx/set", t, `COM1: ${t.length} bytes sent`);
+  });
   $("rescan").addEventListener("click", () => {
     if (confirm("Rescan the KBUS? All outputs go to 0 until they are written again.")) publish("bus/rescan/set", true, "Rescan KBUS");
   });
