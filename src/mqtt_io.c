@@ -3,9 +3,11 @@
 // own real-time thread (gateway.c); the two share only the locked process images.
 #include "mqtt_io.h"
 #include "gateway.h"
+#include "json.h"
 #include "log.h"
 #include "modules.h"
 #include "mqtt_client.h"
+#include "regcom.h"
 #include "serial.h"
 #include "stepper.h"
 
@@ -66,6 +68,11 @@ static struct {
     const char *f_func[GW_MAX_CHANNELS];
 
     uint8_t  stp_pub[256];                              // positions with a published stepper/state
+
+    // status register of the AI channels (regcom.h): <prefix>/ai/<n>/status, index = n-1
+    uint16_t st_pub[GW_MAX_CHANNELS];                   // value last published
+    uint8_t  st_valid[GW_MAX_CHANNELS];                 // topic published by this run
+    uint8_t  st_seen[GW_MAX_CHANNELS];                  // retained topic of an earlier run found
 
     // write watchdog (MQTT_WATCHDOG_S)
     int      wd_armed;                                  // a write or watchdog/set was received
@@ -310,6 +317,68 @@ static void publish_functions(int layout, int band)
     }
 }
 
+// <prefix>/ai/<n>/status: register 6 of every AI channel (regcom.c), retained, when it changed
+// and after (re)connecting. Removed for channels that no longer exist or whose module has
+// no register access.
+static void publish_ai_status(void)
+{
+    static uint8_t state[GW_MAX_CHANNELS];
+    static uint16_t val[GW_MAX_CHANNELS];
+    const size_t n = gateway_channel_count(IO_AI);
+    regcom_status(state, val, GW_MAX_CHANNELS);
+    char t[64], v[16];
+    for (size_t i = 0; i < GW_MAX_CHANNELS; ++i) {
+        if (i >= n || state[i] == REGCOM_UNSUPPORTED) {
+            if (m.st_valid[i] || m.st_seen[i]) {
+                snprintf(t, sizeof(t), "%s/ai/%zu/status", m.cfg->topic_prefix, i + 1);
+                delete_topic(t);
+                m.st_valid[i] = m.st_seen[i] = 0;
+            }
+            continue;
+        }
+        if (state[i] != REGCOM_VALID || (!m.full && m.st_valid[i] && val[i] == m.st_pub[i]))
+            continue;
+        snprintf(t, sizeof(t), "ai/%zu/status", i + 1);
+        snprintf(v, sizeof(v), "%u", (unsigned)val[i]);
+        pub(t, v, 1);
+        m.st_pub[i] = val[i];
+        m.st_valid[i] = 1;
+        m.st_seen[i] = 0;
+    }
+}
+
+// <prefix>/module/<pos>/reg/value: answer to a reg/get (not retained).
+static void reg_reply(unsigned long pos, long table, long reg, int ok, uint16_t value, const char *err,
+                      const char *id)
+{
+    char p[256], t[64];
+    size_t b = (size_t)snprintf(p, sizeof(p), "{");
+    if (table >= 0)
+        b += (size_t)snprintf(p + b, sizeof(p) - b, "\"table\":%ld,", table);
+    if (reg >= 0)
+        b += (size_t)snprintf(p + b, sizeof(p) - b, "\"register\":%ld,", reg);
+    if (ok)
+        b += (size_t)snprintf(p + b, sizeof(p) - b, "\"value\":%u,\"ok\":true", (unsigned)value);
+    else
+        b += (size_t)snprintf(p + b, sizeof(p) - b, "\"ok\":false,\"error\":\"%s\"", err);
+    if (id && *id)
+        b += (size_t)snprintf(p + b, sizeof(p) - b, ",\"id\":%s", id);
+    snprintf(p + b, sizeof(p) - b, "}");
+    snprintf(t, sizeof(t), "module/%lu/reg/value", pos);
+    pub(t, p, 0);
+}
+
+static void publish_reg_results(void)
+{
+    regcom_result_t r;
+    while (regcom_pop_result(&r)) {
+        reg_reply(r.pos, r.table, r.reg, r.ok, r.value, r.error, r.id);
+        if (m.cfg->mqtt_log >= 2 || (!r.ok && m.cfg->mqtt_log >= 1))
+            LOG_INFO("register read module %u table %u register %u: %s%s", r.pos, r.table, r.reg,
+                     r.ok ? "ok" : "failed: ", r.ok ? "" : r.error);
+    }
+}
+
 // One tick: compare the process image with what was published, publish the differences.
 static void publish_state(void)
 {
@@ -386,6 +455,8 @@ static void publish_state(void)
     }
 
     publish_functions(layout_changed, band);
+    publish_ai_status();
+    publish_reg_results();
 
     // raw input bytes of complex modules, one message per module, only when they changed
     size_t nmod = 0;
@@ -719,6 +790,63 @@ static int module_topic_stale(const char *rest)
     return strstr(what, "/set") == NULL;                // other function topics of this position: stale
 }
 
+// <prefix>/module/<pos>/reg/get {"table":0,"register":6,"id":"x"}: read ONE register of the
+// module (register communication, read only). Answered on module/<pos>/reg/value.
+static void on_reg_get(const char *t, const char *pos_s, const char *p, size_t len)
+{
+    char *end = NULL;
+    const unsigned long pos = strtoul(pos_s, &end, 10);
+    if (end == pos_s || *end != '/' || pos == 0 || pos > 255)
+        return;
+    char j[256], id[REGCOM_ID_MAX] = "", sid[64];
+    long table = -1, reg = -1, num;
+    int present = 0;
+    const char *err = NULL;
+    if (len >= sizeof(j)) {
+        err = "request too long";
+    } else {
+        memcpy(j, p, len);
+        j[len] = '\0';
+        const char *idv = json_value(j, "id");
+        if (idv && *idv == '"') {
+            if (json_str(j, "id", sid, sizeof(sid)) != 0)
+                err = "id must be a short string without escapes";
+            else
+                snprintf(id, sizeof(id), "\"%s\"", sid);
+        } else if (idv) {
+            if (json_num(j, "id", &num, &present) != 0)
+                err = "id must be a string or an integer";
+            else
+                snprintf(id, sizeof(id), "%ld", num);
+        }
+        if (!err && (json_num(j, "table", &num, &present) != 0 || !present || num < 0 || num > 255))
+            err = "expected \\\"table\\\": 0..255";
+        else if (!err)
+            table = num;
+        if (!err && (json_num(j, "register", &num, &present) != 0 || !present || num < 0 || num > 63))
+            err = "expected \\\"register\\\": 0..63";
+        else if (!err)
+            reg = num;
+    }
+    size_t nmod = 0, mi;
+    const kbus_module_t *mods = gateway_modules(&nmod);
+    for (mi = 0; mi < nmod && mods[mi].position != pos; ++mi)
+        ;
+    if (!err && mi == nmod)
+        err = "no module at this position";
+    if (!err && (mods[mi].type & 0x8000u))
+        err = "digital module: no registers";
+    if (!err) {
+        const int r = regcom_request((uint16_t)pos, (uint16_t)table, (uint16_t)reg, id);
+        if (r == 0)
+            return;                                     // answered by publish_reg_results()
+        err = r == -1 ? "busy: too many requests" : "register access not available";
+    }
+    if (m.cfg->mqtt_log >= 1)
+        LOG_WARN("rejected %s: %s", t, err);
+    reg_reply(pos, table, reg, 0, 0, err, id);
+}
+
 // ---------------------------------------------------------------------------
 // 750-671 stepper drivers (stepper.c)
 // ---------------------------------------------------------------------------
@@ -870,6 +998,18 @@ static void on_message(void *ctx, const char *t, const char *p, size_t len, int 
     }
     if (strncmp(rest, "module/", 7) == 0) {
         const size_t rl = strlen(rest);
+        if (rl > 15 && strcmp(rest + rl - 8, "/reg/get") == 0) {                  // module/<pos>/reg/get
+            if (m.state != ST_RUN)
+                return;
+            if (retained) {
+                if (!m.warned_retained_set++)
+                    LOG_WARN("ignoring retained request %s: publish it WITHOUT the retain flag "
+                             "(delete it with: mosquitto_pub -r -n -t '%s')", t, t);
+                return;
+            }
+            on_reg_get(t, rest + 7, p, len);
+            return;
+        }
         if (rl > 23 && strcmp(rest + rl - 16, "/stepper/cmd/set") == 0) {          // module/<pos>/stepper/cmd/set
             if (m.state != ST_RUN)
                 return;
@@ -900,6 +1040,19 @@ static void on_message(void *ctx, const char *t, const char *p, size_t len, int 
     const int is_io = parts >= 2 && io_kind_parse(a, &k) == 0;
 
     if (m.state == ST_CLEANUP) {
+        if (retained && len > 0 && is_io && k == IO_AI && parts == 3 && strcmp(c, "status") == 0) {
+            // ai/<n>/status of an earlier run: removed now when the channel does not exist,
+            // else as soon as its module turns out to have no register access
+            char *end = NULL;
+            const unsigned long n = strtoul(b, &end, 10);
+            if (end == b || *end != '\0' || n == 0 || n > gateway_channel_count(IO_AI)) {
+                LOG_INFO("removing old retained topic %s", t);
+                delete_topic(t);
+            } else {
+                m.st_seen[n - 1] = 1;
+            }
+            return;
+        }
         // Retained channel topics from an earlier run: remove those of channels that do not exist now.
         if (!retained || len == 0 || !is_io || parts != 2)
             return;
@@ -945,7 +1098,7 @@ static void on_message(void *ctx, const char *t, const char *p, size_t len, int 
 // The retained topics of an earlier run that are checked after connecting: the channel
 // topics (removed when the channel does not exist now) and the COM1 topics (removed when
 // COM1 is off now).
-#define CLEANUP_FILTERS (IO_KIND_COUNT + 3)
+#define CLEANUP_FILTERS (IO_KIND_COUNT + 4)
 static void cleanup_filters(const char **f, char fb[][160])
 {
     for (int k = 0; k < IO_KIND_COUNT; ++k) {
@@ -958,6 +1111,8 @@ static void cleanup_filters(const char **f, char fb[][160])
     f[IO_KIND_COUNT + 1] = fb[IO_KIND_COUNT + 1];
     snprintf(fb[IO_KIND_COUNT + 2], 160, "%s/module/+/+/+", m.cfg->topic_prefix);        // temperature/<n>, stepper/state
     f[IO_KIND_COUNT + 2] = fb[IO_KIND_COUNT + 2];
+    snprintf(fb[IO_KIND_COUNT + 3], 160, "%s/ai/+/status", m.cfg->topic_prefix);         // AI status register
+    f[IO_KIND_COUNT + 3] = fb[IO_KIND_COUNT + 3];
 }
 
 static int start_session(void)
@@ -1000,6 +1155,14 @@ static int finish_cleanup(void)
         if (mqtt_subscribe(&m.cli, sf, nf) != 0)
             return -1;
     }
+    {   // register reads: read only, so also with MQTT_WRITE_ENABLE=0
+        char r0[160];
+        snprintf(r0, sizeof(r0), "%s/module/+/reg/get", m.cfg->topic_prefix);
+        const char *rf[1] = { r0 };
+        if (mqtt_subscribe(&m.cli, rf, 1) != 0)
+            return -1;
+    }
+    regcom_drop_results();                             // answers to requests of the lost connection
     // Frames received while there was no broker connection are old: not published.
     uint8_t frame[SERIAL_BUF];
     size_t old = 0;
@@ -1023,6 +1186,7 @@ int mqtt_io_run(const gw_config_t *cfg, volatile sig_atomic_t *stop)
     m.cfg = cfg;
     mqtt_init(&m.cli, on_message, NULL);
     m.version_seen = gateway_config_version();
+    regcom_layout();
 
     if (cfg->mqtt_priority > 0) {
         struct sched_param sp = { .sched_priority = cfg->mqtt_priority };
@@ -1091,6 +1255,7 @@ int mqtt_io_run(const gw_config_t *cfg, volatile sig_atomic_t *stop)
             m.version_seen = ver;
             m.layout = 1;
             stepper_reset_all();                       // before the next stepper tick
+            regcom_layout();                           // new AI channel list for the status reads
         }
 
         watchdog_check(now);                           // also while the broker is away

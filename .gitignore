@@ -10,9 +10,10 @@ __pycache__/
 # OsCommon.h is our own minimal stand-in and stays in the repo.
 sdk/include/dal/
 sdk/include/ldkc_kbus_information.h
+sdk/include/ldkc_kbus_register_communication.h
 
 # WAGO documents (download them from wago.com instead)
-docs/reference/**/*.pdf
+docs/**/*.pdf
 
 # Native packages (tools/build-ipk.sh)
 build-ipk/

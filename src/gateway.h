@@ -36,7 +36,8 @@ typedef struct {
     int         realtime;
 } gw_stats_t;
 
-enum { GW_OK = 0, GW_ENOENT = -1, GW_EREADONLY = -2, GW_ERANGE = -3 };
+enum { GW_OK = 0, GW_ENOENT = -1, GW_EREADONLY = -2, GW_ERANGE = -3,
+       GW_EFAILED = -4, GW_EUNAVAILABLE = -5, GW_EOFFLINE = -6 };
 
 int  gateway_init(const gw_config_t *cfg, kbus_backend_t *backend);
 int  gateway_start(void);
@@ -72,6 +73,13 @@ size_t               gateway_module_input(size_t mi, uint8_t *buf, size_t len);
 // Raw output process data of one module; len must be the module's output size.
 // GW_OK, GW_ENOENT, GW_EREADONLY (no output data), GW_ERANGE (wrong length).
 int                  gateway_module_output(size_t mi, const uint8_t *buf, size_t len);
+// Register read, READ ONLY (register communication of the firmware): count (1..16)
+// registers from <reg> of table <table> of the module at position <pos>. Blocks for about
+// 20 ms per register: call it from a worker thread (regcom.c), never from the MQTT thread.
+// Serialised with bus rescans (a rescan waits for a running read). GW_OK, GW_EFAILED
+// (request failed), GW_EUNAVAILABLE (no register API), GW_EOFFLINE (bus not open).
+int                  gateway_reg_read(uint16_t pos, uint16_t table, uint16_t reg, uint16_t count,
+                                      uint16_t *buf, uint16_t *n);
 void                 gateway_module_name(const kbus_module_t *m, char *buf, size_t len);
 void                 gateway_stats(gw_stats_t *out);
 void                 gateway_reset_stats(void);   // cycles, errors, maximum values and overruns back to 0

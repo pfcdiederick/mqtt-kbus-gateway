@@ -1,9 +1,9 @@
 # WAGO SDK headers
 
-`sdk/include/` holds the ADI/DAL and KBUS-info header files that the real KBUS
+`sdk/include/` holds the ADI/DAL, KBUS-info and KBUS register-communication header files that the real KBUS
 backend is compiled against (`sdk/include/dal/adi_application_interface.h`
-must exist). The libraries are not used from here: kbus-mqtt loads the
-PFC's own libraries at runtime. See README section 2.2.
+must exist). The libraries are not used from here: kbus-gateway loads the
+PFC's own libraries at runtime. See docs/MANUAL.md section 2.3.
 
 **The WAGO headers are not in the git repository** (they carry a WAGO
 "proprietary rights" notice), see `.gitignore`. After cloning, only
@@ -27,10 +27,13 @@ Taken with method A from the WAGO PFC300 firmware SDK (FW30-V04.08.09,
 
 - `include/dal/*` from `dal_1.0.1_arm64.tgz`
 - `include/ldkc_kbus_information.h` from `libdbuskbuscommon_1.0.0.0_arm64.tgz`
+- `include/ldkc_kbus_register_communication.h` from the same package (since 3.4.0:
+  register reads for `kbus/ai/<n>/status` and `kbus/module/<pos>/reg/get`; without
+  it the gateway builds and runs without register access)
 - `include/OsCommon.h`: minimal stand-in (types and attribute macros only)
 
 The headers contain no architecture-specific code. `libdal` has version 1.0.1
 on both the PFC300 (arm64) and the PFC200 FW31 04.09.50 (armv7), and the
 exported `ldkc_KbusInfo_*` functions are identical, so the headers match the
-32-bit libraries that kbus-mqtt loads on the PFC200. Tested on a PFC200
+32-bit libraries that kbus-gateway loads on the PFC200. Tested on a PFC200
 750-8217 with FW31.

@@ -19,6 +19,9 @@
 //   <prefix>/module/<pos>/<function>/<n>  scaled value of a module with a descriptor (750-450 temperature)
 //   <prefix>/watchdog, watchdog/set    write watchdog state / heartbeat (MQTT_WATCHDOG_S)
 //   <prefix>/module/<pos>/stepper/state|response, stepper/cmd/set   750-671 driver (stepper.h)
+//   <prefix>/ai/<n>/status             register 6 of the channel (status), retained (regcom.h)
+//   <prefix>/module/<pos>/reg/get      read one register: {"table":0,"register":6,"id":"x"} (read only)
+//   <prefix>/module/<pos>/reg/value    answer: {"table":0,"register":6,"value":96,"ok":true,"id":"x"}
 //   <prefix>/error                     rejected writes (not retained)
 #ifndef KBUS_GW_MQTT_IO_H
 #define KBUS_GW_MQTT_IO_H

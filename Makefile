@@ -21,7 +21,7 @@ GW_LDFLAGS := -pthread
 GW_LDLIBS  := -ldl
 
 SRCS := src/main.c src/log.c src/config.c src/gateway.c src/mqtt_client.c src/mqtt_io.c \
-        src/serial.c src/modules.c src/stepper.c src/backend_sim.c src/backend_adi.c
+        src/serial.c src/modules.c src/stepper.c src/json.c src/regcom.c src/backend_sim.c src/backend_adi.c
 OBJS := $(SRCS:src/%.c=$(BUILD)/%.o)
 
 ifneq ($(wildcard $(SDK)/include/dal/adi_application_interface.h),)

@@ -34,3 +34,5 @@ done
 echo "Imported SDK headers from $SYSROOT into $DEST"
 ls "$DEST/include/dal/adi_application_interface.h"
 find "$DEST/include" -maxdepth 2 -name 'ldkc_kbus_information.h' | head -n1
+find "$DEST/include" -maxdepth 2 -name 'ldkc_kbus_register_communication.h' | head -n1 | grep . ||
+    echo "warning: ldkc_kbus_register_communication.h not found: no register access (ai/<n>/status, reg/get)" >&2

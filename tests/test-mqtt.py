@@ -172,6 +172,7 @@ def sim(b):
     check(f"module/{pos}/temperature/4 follows AO2: -200.5", lambda: b.wait(f"module/{pos}/temperature/4", lambda v: v == "-200.5"))
     check("raw AI channel stays raw", lambda: b.wait(f"ai/{rtd['channels']['ai'][3]}", lambda v: v == str(65536 - 2005)))
     b.set("ao/2/set", "0")
+    registers(b, mods)
     stepper(b, mods)
     b.set("ao/1/set", "12345")
     check("ao/1/set 12345 -> ao/1, ai/4 (loopback)",
@@ -200,6 +201,79 @@ def sim(b):
     check("bus/rescan/set -> configversion + 1", lambda: b.wait("bus/configversion", lambda x: x and int(x) == ver + 1, 5))
     # after a rescan all outputs are 0 again
     check("outputs 0 after the rescan", lambda: b.wait("do/all", lambda x: x and not any(json.loads(x))))
+
+
+def reg_get(b, pos, payload, rid, timeout=3.0):
+    """module/<pos>/reg/get, returns the answer (module/<pos>/reg/value) with this id."""
+    b.set(f"module/{pos}/reg/get", payload)
+    return json.loads(b.wait(f"module/{pos}/reg/value",
+                             lambda v: v is not None and json.loads(v).get("id") == rid, timeout))
+
+
+def registers(b, mods):
+    """Register reads (simulation: register 6 of the 750-450 = 96 at >= 850.0 degC, 8 = type)."""
+    rtd = next(m for m in mods if m["typeCode"] == 450)
+    pos, ai = rtd["position"], rtd["channels"]["ai"]
+    others = [n for m in mods if m["typeCode"] != 450 for n in m["channels"].get("ai", [])]
+    check(f"ai/{ai[2]}/status = 96 (850.0 degC)", lambda: b.wait(f"ai/{ai[2]}/status", lambda v: v == "96", 5))
+    for n in (ai[0], ai[1], ai[3], *others):
+        check(f"ai/{n}/status = 0", lambda n=n: b.wait(f"ai/{n}/status", lambda v: v == "0", 5))
+    check(f"ai/{len(ai) + len(others) + 1}/status absent",
+          lambda: b.values.get(f"ai/{len(ai) + len(others) + 1}/status") is None or (_ for _ in ()).throw(AssertionError("present")))
+    b.set("ao/2/set", "8500")                             # AI8 = AO2: 850.0 degC -> status 96 (read once per second)
+    check(f"ai/{ai[3]}/status follows: 96", lambda: b.wait(f"ai/{ai[3]}/status", lambda v: v == "96", 4))
+    b.set("ao/2/set", "0")
+    check(f"ai/{ai[3]}/status back to 0", lambda: b.wait(f"ai/{ai[3]}/status", lambda v: v == "0", 4))
+
+    r = reg_get(b, pos, '{"table":2,"register":6,"id":"x"}', "x")
+    check("reg/get table 2 register 6", lambda: r == {"table": 2, "register": 6, "value": 96, "ok": True, "id": "x"} or (_ for _ in ()).throw(AssertionError(r)))
+    r = reg_get(b, pos, '{"table":0,"register":8,"id":7}', 7)
+    check("reg/get register 8 = 450, numeric id", lambda: r["ok"] and r["value"] == 450 or (_ for _ in ()).throw(AssertionError(r)))
+    digital = next(m["position"] for m in mods if m["typeCode"] & 0x8000)
+    for p_, payload, part in ((pos, '{"table":9,"register":6,"id":"e1"}', "read failed"),
+                              (pos, '{"table":0,"register":64,"id":"e2"}', "register"),
+                              (pos, '{"register":6,"id":"e3"}', "table"),
+                              (pos, 'nonsense', "table"),
+                              (digital, '{"table":0,"register":6,"id":"e4"}', "digital"),
+                              (99, '{"table":0,"register":6,"id":"e5"}', "no module")):
+        rid = json.loads(payload).get("id") if payload.startswith("{") else None
+        if rid is None:
+            b.set(f"module/{p_}/reg/get", payload)
+            r = json.loads(b.wait(f"module/{p_}/reg/value", lambda v: v is not None and "id" not in json.loads(v)))
+        else:
+            r = reg_get(b, p_, payload, rid)
+        check(f"reg/get module {p_} {payload}: ok false, {part}",
+              lambda r=r, part=part: (not r["ok"] and part in r["error"]) or (_ for _ in ()).throw(AssertionError(r)))
+    # many requests at once: each one answered (queued) or refused as busy, none lost
+    ids = [f"q{i}" for i in range(24)]
+    for i in ids:
+        b.set(f"module/{pos}/reg/get", json.dumps({"table": 0, "register": 8, "id": i}))
+    got = {}
+    end = time.monotonic() + 5
+
+    def collect():
+        while len(got) < len(ids) and time.monotonic() < end:
+            with b.cond:
+                b.cond.wait(0.1)
+        missing = set(ids) - set(got)
+        if missing:
+            raise AssertionError(f"no answer for {sorted(missing)}")
+    seen = b.c.on_message
+
+    def on(c, u, msg):
+        seen(c, u, msg)
+        if msg.topic.endswith(f"module/{pos}/reg/value"):
+            j = json.loads(msg.payload)
+            if str(j.get("id", "")).startswith("q"):
+                got[j["id"]] = j
+    b.c.on_message = on
+    try:
+        check("24 requests at once: all answered (ok or busy)", collect)
+    finally:
+        b.c.on_message = seen
+    check("  queued ones ok, the rest busy",
+          lambda: all(j["ok"] or "busy" in j["error"] for j in got.values()) and any(j["ok"] for j in got.values())
+          or (_ for _ in ()).throw(AssertionError(got)))
 
 
 class Gateway:
@@ -370,8 +444,9 @@ def stepper(b, mods):
 
 def watchdog(b, a):
     # retained topics of an earlier, different node: removed at the start, real ones kept
-    stale = ("module/9/temperature/1", "module/9/stepper/state", "module/9/in", "module/3/temperature/7", "module/1/in")
-    for t in stale:
+    stale = ("module/9/temperature/1", "module/9/stepper/state", "module/9/in", "module/3/temperature/7", "module/1/in",
+             "ai/9/status")
+    for t in stale + ("ai/7/status",):
         b.set(t, "old", retain=True)
     b.wait("module/9/in", lambda v: v == "old")
     g = Gateway(a, "")
@@ -379,6 +454,7 @@ def watchdog(b, a):
     try:
         check("status online", lambda: b.wait("status", lambda v: v == "online", 5))
         check("old module topics of another node removed", lambda: [b.wait(t, lambda v: v is None, 5) for t in stale])
+        check("ai/7/status of the earlier run replaced", lambda: b.wait("ai/7/status", lambda v: v == "96", 5))
         check("current module topics kept", lambda: (b.wait("module/3/temperature/1", lambda v: v == "21.4"),
                                                       b.wait_state("module/4/stepper/state", lambda j: "ready" in j)))
         check("watchdog ok before the first write", lambda: b.wait("watchdog", lambda v: v == "ok"))

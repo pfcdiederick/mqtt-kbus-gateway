@@ -23,6 +23,8 @@ typedef struct {
     int         mqtt_priority;      // MQTT_PRIORITY      (default 0): SCHED_FIFO priority of the MQTT thread, 0 = normal
     int         raw_min_ms;         // MQTT_RAW_MIN_MS    (default 100): <prefix>/module/<pos>/in at most once per
                                     //   N ms per module (the latest bytes always follow); 0 = every change
+    int         ai_status_ms;       // MQTT_AI_STATUS_MS  (default 1000, minimum 1000; 0 = off): <prefix>/ai/<n>/status,
+                                    //   register 6 of every analog input channel read at most once per N ms
     int         watchdog_s;         // MQTT_WATCHDOG_S    (default 0 = off): no write and no <prefix>/watchdog/set
                                     //   for N s (after the first one) -> all outputs 0 (safe state)
     // Module descriptors (modules.c)

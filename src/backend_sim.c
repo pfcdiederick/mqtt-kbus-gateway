@@ -11,6 +11,11 @@
 //   pos 6  750-530  8DO   out bits 160..167
 //   pos 7  750-402  4DI   in  bits 232..235 (binary seconds counter)
 //
+// Register communication (read only, KBUS_REG_*): every module except the digital ones,
+// one table per channel. Register 6 of the 750-450 = 0x0060 while the channel shows
+// 850.0 degC or more (like a real 750-450 with an open input), else 0; register 8 =
+// module type; register 30 = type * 10 (order number); everything else 0. 20 ms per read.
+//
 // Hot-plug test (KBUS_SIM_HOTPLUG=<file>): while <file> exists, an 8th module
 // "was added" (750-430 8DI, in bits 240..247, all inputs TRUE). Until the bus is
 // opened again, every cycle fails, as the real KBUS does after a change; the
@@ -18,12 +23,19 @@
 #include "backend.h"
 #include "log.h"
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
 static int sim_extra;          // 1 = the 6th module was present at the last open
+
+// For the register reads (other thread than the cycle): modules and input image.
+static pthread_mutex_t sim_lock = PTHREAD_MUTEX_INITIALIZER;
+static kbus_module_t   sim_mods[8];
+static size_t          sim_count;
+static uint8_t         sim_in[32];
 
 static int hotplug_present(void)
 {
@@ -56,6 +68,10 @@ static int sim_open(kbus_backend_t *self, kbus_module_t *m, size_t max_modules,
     if (n > max_modules)
         n = max_modules;
     memcpy(m, node, n * sizeof(node[0]));
+    pthread_mutex_lock(&sim_lock);
+    memcpy(sim_mods, node, n * sizeof(node[0]));
+    sim_count = n;
+    pthread_mutex_unlock(&sim_lock);
     *module_count = n;
     *in_bytes = sim_extra ? 31 : 30;
     *out_bytes = 21;
@@ -173,7 +189,43 @@ static int sim_exchange(kbus_backend_t *self, const uint8_t *out, size_t out_len
     in[29] = (uint8_t)(now.tv_sec & 0x0f);                         // DI9..12 = counter
     if (sim_extra && in_len >= 31)
         in[30] = 0xff;                                             // DI13..20 (hot-plugged 8DI)
+    pthread_mutex_lock(&sim_lock);
+    memcpy(sim_in, in, in_len < sizeof(sim_in) ? in_len : sizeof(sim_in));
+    pthread_mutex_unlock(&sim_lock);
     return 0;
+}
+
+static int sim_reg_read(kbus_backend_t *self, uint16_t terminal, uint16_t table, uint16_t reg,
+                        uint16_t count, uint16_t *buf, uint16_t *n)
+{
+    (void)self;
+    usleep(20000);                                                 // like the real register access
+    pthread_mutex_lock(&sim_lock);
+    int rc = KBUS_REG_FAILED;
+    if (terminal >= 1 && terminal <= sim_count) {
+        const kbus_module_t *m = &sim_mods[terminal - 1];
+        const unsigned tables = m->channel_count ? m->channel_count : 1;
+        if (!(m->type & 0x8000u) && table < tables) {
+            for (uint16_t i = 0; i < count; ++i) {
+                const unsigned r = reg + i;
+                uint16_t v = 0;
+                if (r == 8)
+                    v = m->type;
+                else if (r == 30)
+                    v = (uint16_t)(m->type * 10u);
+                else if (r == 6 && m->type == 450) {
+                    const size_t b = m->in_offset_bits / 8u + 2u * table;
+                    const int16_t w = (int16_t)(sim_in[b] | (sim_in[b + 1] << 8));
+                    v = w >= 8500 ? 0x0060 : 0;
+                }
+                buf[i] = v;
+            }
+            *n = count;
+            rc = KBUS_REG_OK;
+        }
+    }
+    pthread_mutex_unlock(&sim_lock);
+    return rc;
 }
 
 static void sim_close(kbus_backend_t *self)
@@ -186,7 +238,7 @@ kbus_backend_t *backend_sim_create(const gw_config_t *cfg)
     (void)cfg;
     static kbus_backend_t backend = {
         .name = "simulation", .open = sim_open, .exchange = sim_exchange,
-        .close = sim_close, .priv = NULL,
+        .close = sim_close, .reg_read = sim_reg_read, .priv = NULL,
     };
     return &backend;
 }

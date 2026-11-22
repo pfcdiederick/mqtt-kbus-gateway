@@ -78,6 +78,12 @@ void config_load(gw_config_t *cfg)
     cfg->mqtt_priority    = env_int("MQTT_PRIORITY", 0, 0, 99);
     cfg->watchdog_s       = env_int("MQTT_WATCHDOG_S", 0, 0, 3600);
     cfg->raw_min_ms       = env_int("MQTT_RAW_MIN_MS", 100, 0, 60000);
+    cfg->ai_status_ms     = env_int("MQTT_AI_STATUS_MS", 1000, 0, 3600000);
+    if (cfg->ai_status_ms > 0 && cfg->ai_status_ms < 1000) {
+        LOG_WARN("MQTT_AI_STATUS_MS=%d is below 1000: register 6 is read at most once per second, using 1000",
+                 cfg->ai_status_ms);
+        cfg->ai_status_ms = 1000;
+    }
     cfg->m450_unit        = env_str("MODULE_450_UNIT", "°C");
     cfg->m450_resolution  = 0.1;
     const char *res = getenv("MODULE_450_RESOLUTION");

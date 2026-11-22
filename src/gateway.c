@@ -28,6 +28,10 @@ static struct {
     size_t          in_len, out_len;
 
     pthread_mutex_t lock;
+    // Register reads (blocking, ~20 ms) against open/close of the bus. Never taken by the
+    // cycle thread; gw.lock is never held while waiting for it.
+    pthread_mutex_t reg_lock;
+    int             bus_open;           // under reg_lock: the backend is open (reads allowed)
     pthread_t       thread;
     volatile int    running;
     int             thread_started;
@@ -292,9 +296,12 @@ int gateway_init(const gw_config_t *cfg, kbus_backend_t *backend)
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);  // avoid priority inversion
     pthread_mutex_init(&gw.lock, &attr);
+    pthread_mutex_init(&gw.reg_lock, &attr);
     pthread_mutexattr_destroy(&attr);
 
-    return scan_bus();
+    const int rc = scan_bus();
+    gw.bus_open = rc == 0;
+    return rc;
 }
 
 // Open the bus, read the modules and build the channel map. Used at startup
@@ -357,6 +364,8 @@ int gateway_rescan(void)
     gw.rescan_requested = 0;
     LOG_INFO("KBUS rescan (%s)", automatic ? "after persistent cycle errors" : "requested");
 
+    pthread_mutex_lock(&gw.reg_lock);                  // waits for a running register read
+    gw.bus_open = 0;
     if (gw.thread_started) {
         gw.running = 0;
         pthread_join(gw.thread, NULL);
@@ -374,6 +383,8 @@ int gateway_rescan(void)
     pthread_mutex_unlock(&gw.lock);
 
     const int rc = scan_bus();
+    gw.bus_open = rc == 0;
+    pthread_mutex_unlock(&gw.reg_lock);
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     if (automatic || rc != 0) {
@@ -432,6 +443,8 @@ int gateway_start(void)
 
 void gateway_stop(void)
 {
+    pthread_mutex_lock(&gw.reg_lock);
+    gw.bus_open = 0;
     if (gw.thread_started) {
         gw.running = 0;
         pthread_join(gw.thread, NULL);
@@ -440,6 +453,24 @@ void gateway_stop(void)
     }
     if (gw.be != NULL)
         gw.be->close(gw.be);
+    pthread_mutex_unlock(&gw.reg_lock);
+}
+
+int gateway_reg_read(uint16_t pos, uint16_t table, uint16_t reg, uint16_t count, uint16_t *buf, uint16_t *n)
+{
+    if (count == 0 || count > 16)
+        return GW_ERANGE;
+    if (gw.be == NULL || gw.be->reg_read == NULL)
+        return GW_EUNAVAILABLE;
+    pthread_mutex_lock(&gw.reg_lock);
+    int rc = GW_EOFFLINE;
+    if (gw.bus_open) {
+        *n = 0;
+        const int r = gw.be->reg_read(gw.be, pos, table, reg, count, buf, n);
+        rc = r == KBUS_REG_OK ? GW_OK : r == KBUS_REG_UNAVAILABLE ? GW_EUNAVAILABLE : GW_EFAILED;
+    }
+    pthread_mutex_unlock(&gw.reg_lock);
+    return rc;
 }
 
 size_t gateway_channel_count(io_kind_t kind) { return gw.ch_count[kind]; }

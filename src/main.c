@@ -13,6 +13,7 @@
 #include "log.h"
 #include "modules.h"
 #include "mqtt_io.h"
+#include "regcom.h"
 #include "serial.h"
 
 #include <signal.h>
@@ -63,10 +64,12 @@ int main(void)
     }
 
     serial_start(&cfg);                 // COM1 (SERIAL_DEVICE), transparent forwarding over MQTT
+    regcom_start(&cfg);                 // register reads (read only): ai/<n>/status, module/<pos>/reg/get
 
     const int rc = mqtt_io_run(&cfg, &g_stop);
 
     LOG_INFO("shutting down");
+    regcom_stop();
     serial_stop();
     gateway_stop();
     return rc == 0 ? 0 : 1;

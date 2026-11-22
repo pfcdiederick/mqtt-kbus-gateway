@@ -1,6 +1,7 @@
 // 750-671 stepper controller driver, see stepper.h. Bit names as in the manual
 // (750-671, 2.1.2.11.1.4.1 "Positioning Process Image").
 #include "stepper.h"
+#include "json.h"
 #include "backend.h"
 #include "gateway.h"
 #include "log.h"
@@ -132,56 +133,6 @@ static void finish(uint16_t pos, stp_t *s, const char *result, const char *err)
     s->phase = PH_IDLE;
     s->out[O_C1] &= (uint8_t)~C1_START;
     s->cmd[0] = s->id[0] = '\0';
-}
-
-// ---------------------------------------------------------------------------
-// Minimal JSON: "key":"text" and "key":number in one flat object
-// ---------------------------------------------------------------------------
-static const char *json_value(const char *j, const char *key)
-{
-    char k[40];
-    snprintf(k, sizeof(k), "\"%s\"", key);
-    const char *p = strstr(j, k);
-    if (!p)
-        return NULL;
-    p += strlen(k);
-    while (isspace((unsigned char)*p)) ++p;
-    if (*p != ':')
-        return NULL;
-    ++p;
-    while (isspace((unsigned char)*p)) ++p;
-    return p;
-}
-
-static int json_str(const char *j, const char *key, char *buf, size_t cap)
-{
-    const char *p = json_value(j, key);
-    if (!p || *p != '"')
-        return -1;
-    ++p;
-    size_t n = 0;
-    while (*p && *p != '"' && n + 1 < cap) {
-        if (*p == '\\' || (unsigned char)*p < 0x20)
-            return -1;                       // keep it simple: no escapes in ids / commands
-        buf[n++] = *p++;
-    }
-    if (*p != '"')
-        return -1;
-    buf[n] = '\0';
-    return 0;
-}
-
-static int json_num(const char *j, const char *key, long *v, int *present)
-{
-    const char *p = json_value(j, key);
-    *present = p != NULL;
-    if (!p)
-        return 0;
-    char *end = NULL;
-    *v = strtol(p, &end, 10);
-    if (end == p || (*end && *end != ',' && *end != '}' && !isspace((unsigned char)*end)))
-        return -1;
-    return 0;
 }
 
 // ---------------------------------------------------------------------------
