@@ -430,6 +430,16 @@ Complex modules show `"raw":{"in":24,"out":24}`, modules with a descriptor
 | `overruns` | 0 | cycles started late |
 | `errors` | not increasing | KBUS errors |
 
+`tools/kbus-status.sh <pfc-ip>` (also as a VS Code task) shows these values
+together with the memory and CPU of kbus-gateway; `--stall` shows the hang
+diagnosis files (10). The exchange time grows with the number and type of
+modules (more process data); keep `maxCycleDuration` well below the cycle
+time. The first exchange after a start takes longer: use *Reset Statistics*
+for the steady-state maximum. End to end over MQTT: an input change is on the
+broker within one cycle + the exchange + one `MQTT_PUBLISH_MS` tick (about
+27 ms at 5 / 20 ms); a `.../set` reaches the module at the next cycle (about
+7 ms).
+
 ### 3.5 Rules for writing
 
 - Publish commands **without the retain flag**. A retained command would be
@@ -1023,6 +1033,7 @@ up to 50 messages per second each; use `MQTT_ANALOG_DEADBAND` or a longer
 │   ├── build-ipk.sh           build the .ipk with the SDK toolchain (2.4)
 │   ├── deploy.sh              native: build + copy + opkg install + status
 │   ├── deploy-docker.sh       containers: kbus-gateway, mosquitto, mqtt-bridge, mqtt-manager, mqtt-iec104, mqtt-modbus, or back to native
+│   ├── kbus-status.sh         KBUS timing, health, load and hang diagnosis of a PFC (read only)
 │   └── import-sdk-*.sh        SDK headers (2.3)
 ├── tests/
 │   ├── test-mqtt.py           simulation, COM1, watchdog; real node read-only / write
@@ -1124,6 +1135,7 @@ same steps.
 
 | Symptom | Cause / fix |
 |---|---|
+| The bus stops after a while, `kbus/bus/healthy` = `false`, log: `KBUS cycle hangs` | the KBUS cycle got no CPU or hangs inside the WAGO library. kbus-gateway only observes it (no automatic recovery): after 1 s and again after 10 s it writes `kbus-stall-<time>.txt` next to `KBUS_SETTINGS_STORE` (`/home/kbus-gateway/`): every gateway thread with state, priority, wait point and kernel stack, every real-time thread of the controller that runs or ranks above `KBUS_PRIORITY`, load and CPU counters. Seen on the single-core PFC200 |
 | `opening the KBUS device failed` | another program owns the KBUS: runtime not *None*, a CODESYS project with KBUS, an old gateway container, or the container and the native service at once |
 | `bus/statistics`: `overruns` increasing | the cycle time does not hold on this node: write a higher value to `kbus/bus/cycletime/set` |
 | Cycle time ignores `KBUS_CYCLE_MS` | a value written via `bus/cycletime/set` is stored in `/home/kbus-gateway/kbus-settings.conf` and wins: delete it, restart |
@@ -1214,6 +1226,8 @@ same steps.
 | PC, simulation node, mosquitto 2.0.20 | `tests/test-mqtt.py sim` (all classes, arrays, invalid commands, cycle time, rescan), removal of stale retained topics, ignored retained command, broker restart (reconnect), clean stop and `kill -9` (last will), simulated hot-plug, chain remote broker → mqtt-bridge → kbus-gateway → DO1; COM1 with a virtual serial port (pty); write watchdog |
 | PFC300 750-8302, FW 04.09.01(31), node 8DO + 750-495 (18-11-2026) | all as containers next to CODESYS without KBUS: 0 errors, 0 overruns at 5 ms (exchange max 1.97 ms, wake-up delay max 82 µs); `test-mqtt.py node` and `write --do 1` over the network; the simulation suite on the PFC; mqtt-bridge from a Home Assistant broker; KBUS Manager page with live data |
 | PFC300, FW 04.08.09(30), node 8DO + 750-657 + 750-450 + 750-671 | 750-450 temperatures; write watchdog on a real DO; 750-671 state; register reads (`ai/<n>/status`, `reg/get` on 750-450 and 750-657, refusals, rescan while reading) with unchanged KBUS statistics (0 errors, 0 overruns, longest cycle 2.7 ms) |
+| PFC200 750-8212, FW 04.09.01(31), node 8DI + 8DO + 750-652 (27-11-2026) | kbus-gateway, kbus-mosquitto and mqtt-manager as armv7 containers next to CODESYS in a container without KBUS: 0 errors at 5 ms (exchange 2.2 ms). The bus sometimes stops after a while on this single-core controller (not on the PFC300s): cause still open, the hang detector (3.4.1) records it |
+| PC, simulation node | hang detector (3.4.1): a hanging bus call gives `kbus/bus/healthy` = `false` and two diagnosis files, "running again" when it continues; no measurable CPU or memory cost on a PFC300 (4.3 % of one core before and after) |
 | Build | the arm64 package and all arm64 images build with the WAGO toolchain |
 | PC, mqtt-iec104 (2026-11-22) | `tests/test-iec104.py`: 22 checks with a c104 IEC 104 client against mosquitto 2.0.20; image builds for arm64 and amd64 |
 | PC, mqtt-modbus (2026-11-22) | `tests/test-modbus.py`: 25 checks against a pymodbus TCP server and mosquitto 2.0.20; image builds for arm64, armv7 and amd64 |
@@ -1249,7 +1263,8 @@ same steps.
    the broker as an image, and the KBUS Manager page at `/kbus` (since
    2026-11-20; before that a read-only monitor at `/mqtt`).
 4. **3.3: COM1**, module descriptors (750-450), the 750-671 driver and the
-   write watchdog. **3.4: register reads** (`ai/<n>/status`, `reg/get`).
+   write watchdog. **3.4: register reads** (`ai/<n>/status`, `reg/get`). **3.4.1: hang detector** with diagnosis files (diagnosis only, no automatic
+   recovery) and `tools/kbus-status.sh`.
 5. **mqtt-iec104**: IEC 104 gateway with a YAML mapping, based on the
    standalone `docker-mqtt-104` project; **mqtt-modbus**: Modbus TCP
    bridge with a YAML configuration, based on `docker-mqtt-modbus`.

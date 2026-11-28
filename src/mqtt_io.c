@@ -12,6 +12,8 @@
 #include "stepper.h"
 
 #include <ctype.h>
+#include <dirent.h>
+#include <time.h>
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
@@ -73,6 +75,11 @@ static struct {
     uint16_t st_pub[GW_MAX_CHANNELS];                   // value last published
     uint8_t  st_valid[GW_MAX_CHANNELS];                 // topic published by this run
     uint8_t  st_seen[GW_MAX_CHANNELS];                  // retained topic of an earlier run found
+
+    // hang detector of the KBUS cycle (diagnosis only)
+    uint64_t stall_progress;                            // cycles + errors at the last change
+    int64_t  stall_since;
+    int      stalled;
 
     // write watchdog (MQTT_WATCHDOG_S)
     int      wd_armed;                                  // a write or watchdog/set was received
@@ -484,9 +491,10 @@ static void publish_state(void)
 
     gw_stats_t st;
     gateway_stats(&st);
-    if (m.full || st.healthy != m.healthy_pub) {
-        pub("bus/healthy", st.healthy ? "true" : "false", 1);
-        m.healthy_pub = st.healthy;
+    const int healthy = st.healthy && !m.stalled;      // a hanging cycle is not healthy either
+    if (m.full || healthy != m.healthy_pub) {
+        pub("bus/healthy", healthy ? "true" : "false", 1);
+        m.healthy_pub = healthy;
     }
     if (m.full || st.cycle_ms != m.cycle_pub) {
         char v[16];
@@ -554,6 +562,167 @@ static int parse_value(io_kind_t k, const char *s, size_t len, int allow_null, i
         return -1;
     *out = (int32_t)v;
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Hang detector (diagnosis only, no recovery): the KBUS cycle thread neither succeeds nor
+// fails for STALL_MS (it hangs, e.g. inside the WAGO library, or does not get the CPU).
+// Failing cycles are handled by gateway.c; a rescan runs in this thread, so it cannot look
+// like a hang. On a hang: healthy = false, an error in the log and a diagnosis file (at
+// 1 s and again at 10 s): every thread of the gateway with its kernel stack, every
+// real-time thread of the controller that runs or waits for the CPU, the load. Cost while
+// the bus runs: one look at the counters per tick.
+// ---------------------------------------------------------------------------
+#define STALL_MS        1000
+#define STALL_SECOND_MS 10000
+#define STALL_THREADS   400                             // threads of other processes listed at most
+
+static void stall_dump(const char *why, int64_t ms, const gw_stats_t *st)
+{
+    char dir[256] = "/tmp", path[320];
+    if (*m.cfg->settings_store) {                       // the persistent folder of the settings file
+        snprintf(dir, sizeof(dir), "%s", m.cfg->settings_store);
+        char *sl = strrchr(dir, '/');
+        if (sl && sl != dir) *sl = '\0';
+    }
+    const time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    char stamp[32];
+    strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
+    snprintf(path, sizeof(path), "%s/kbus-stall-%s.txt", dir, stamp);
+    FILE *f = fopen(path, "a");
+    if (!f) {
+        LOG_WARN("cannot write the diagnosis file %s", path);
+        return;
+    }
+    fprintf(f, "kbus-gateway %s: %s (no KBUS cycle for %lld ms)\n", GW_VERSION, why, (long long)ms);
+    fprintf(f, "cycles=%llu errors=%llu overruns=%llu cycle=%d ms last=%u us max=%u us max_wakeup_delay=%u us\n",
+            (unsigned long long)st->cycles, (unsigned long long)st->errors, (unsigned long long)st->overruns,
+            st->cycle_ms, st->last_cycle_us, st->max_cycle_us, st->max_late_us);
+    char line[256];
+    FILE *la = fopen("/proc/loadavg", "r");
+    if (la) {
+        if (fgets(line, sizeof(line), la)) fprintf(f, "loadavg: %s", line);
+        fclose(la);
+    }
+    fprintf(f, "threads (name state policy rtprio wchan):\n");
+    DIR *d = opendir("/proc/self/task");
+    struct dirent *e;
+    while (d && (e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.')
+            continue;
+        char p[300], comm[64] = "?", wchan[96] = "?", stat[1024] = "";
+        FILE *x;
+        snprintf(p, sizeof(p), "/proc/self/task/%s/comm", e->d_name);
+        if ((x = fopen(p, "r"))) { if (fgets(comm, sizeof(comm), x)) comm[strcspn(comm, "\n")] = 0; fclose(x); }
+        snprintf(p, sizeof(p), "/proc/self/task/%s/wchan", e->d_name);
+        if ((x = fopen(p, "r"))) { if (!fgets(wchan, sizeof(wchan), x)) strcpy(wchan, "?"); fclose(x); }
+        snprintf(p, sizeof(p), "/proc/self/task/%s/stat", e->d_name);
+        if ((x = fopen(p, "r"))) { if (!fgets(stat, sizeof(stat), x)) stat[0] = 0; fclose(x); }
+        // fields after "(comm)": 3 state ... 40 rt_priority 41 policy
+        char state = '?';
+        unsigned rtprio = 0, policy = 0;
+        const char *r = strrchr(stat, ')');
+        if (r) {
+            int field = 2;
+            for (const char *c = r + 1; *c; ++c) {
+                if (*c != ' ') continue;
+                ++field;
+                if (field == 3) state = c[1];
+                else if (field == 40) rtprio = (unsigned)strtoul(c + 1, NULL, 10);
+                else if (field == 41) { policy = (unsigned)strtoul(c + 1, NULL, 10); break; }
+            }
+        }
+        fprintf(f, "  %-6s %-16s %c %u %3u %s\n", e->d_name, comm, state, policy, rtprio, wchan);
+        snprintf(p, sizeof(p), "/proc/self/task/%s/stack", e->d_name);   // kernel stack (root)
+        if ((x = fopen(p, "r"))) {
+            while (fgets(line, sizeof(line), x))
+                fprintf(f, "           %s", line);
+            fclose(x);
+        }
+    }
+    if (d) closedir(d);
+
+    // The rest of the controller: every real-time thread that runs or waits for the CPU
+    // (state R), and every thread with a real-time priority above our KBUS cycle.
+    fprintf(f, "real-time threads of the controller (pid/tid name state policy rtprio), R = running/waiting for CPU:\n");
+    DIR *pd = opendir("/proc");
+    struct dirent *pe;
+    int listed = 0;
+    while (pd && (pe = readdir(pd)) != NULL && listed < STALL_THREADS) {
+        if (pe->d_name[0] < '1' || pe->d_name[0] > '9')
+            continue;
+        char tdir[300];
+        snprintf(tdir, sizeof(tdir), "/proc/%s/task", pe->d_name);
+        DIR *td = opendir(tdir);
+        struct dirent *te;
+        while (td && (te = readdir(td)) != NULL && listed < STALL_THREADS) {
+            if (te->d_name[0] == '.')
+                continue;
+            char p[600], stat[1024] = "";
+            snprintf(p, sizeof(p), "/proc/%s/task/%s/stat", pe->d_name, te->d_name);
+            FILE *x = fopen(p, "r");
+            if (!x)
+                continue;
+            if (!fgets(stat, sizeof(stat), x)) stat[0] = 0;
+            fclose(x);
+            const char *l = strchr(stat, '('), *r = strrchr(stat, ')');
+            if (!l || !r)
+                continue;
+            char state = '?';
+            unsigned rtprio = 0, policy = 0;
+            int field = 2;
+            for (const char *c = r + 1; *c; ++c) {
+                if (*c != ' ') continue;
+                ++field;
+                if (field == 3) state = c[1];
+                else if (field == 40) rtprio = (unsigned)strtoul(c + 1, NULL, 10);
+                else if (field == 41) { policy = (unsigned)strtoul(c + 1, NULL, 10); break; }
+            }
+            if (policy == 0 || (state != 'R' && (int)rtprio <= m.cfg->rt_priority))
+                continue;
+            fprintf(f, "  %s/%-6s %-16.*s %c %u %3u\n", pe->d_name, te->d_name, (int)(r - l - 1), l + 1,
+                    state, policy, rtprio);
+            ++listed;
+        }
+        if (td) closedir(td);
+    }
+    if (pd) closedir(pd);
+    FILE *ps = fopen("/proc/stat", "r");                // cpu counters (compare the two files)
+    if (ps) {
+        if (fgets(line, sizeof(line), ps)) fprintf(f, "/proc/stat: %s", line);
+        fclose(ps);
+    }
+    fclose(f);
+    LOG_ERROR("diagnosis written to %s", path);
+}
+
+static void stall_check(int64_t now)
+{
+    gw_stats_t st;
+    gateway_stats(&st);
+    const uint64_t progress = st.cycles + st.errors;
+    if (progress != m.stall_progress || m.stall_since == 0) {
+        if (m.stalled)
+            LOG_WARN("KBUS cycle running again after %lld ms", (long long)(now - m.stall_since));
+        m.stall_progress = progress;
+        m.stall_since = now;
+        m.stalled = 0;
+        return;
+    }
+    const int64_t ms = now - m.stall_since;
+    if (!m.stalled && ms >= STALL_MS) {
+        m.stalled = 1;
+        LOG_ERROR("KBUS cycle hangs: no cycle for %lld ms (last exchange %u us, longest %u us)",
+                  (long long)ms, st.last_cycle_us, st.max_cycle_us);
+        stall_dump("KBUS cycle hangs", ms, &st);
+    }
+    if (m.stalled == 1 && ms >= STALL_SECOND_MS) {     // second picture: still the same situation?
+        m.stalled = 2;
+        LOG_ERROR("KBUS cycle still hangs after %lld ms", (long long)ms);
+        stall_dump("KBUS cycle still hangs", ms, &st);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1258,6 +1427,7 @@ int mqtt_io_run(const gw_config_t *cfg, volatile sig_atomic_t *stop)
             regcom_layout();                           // new AI channel list for the status reads
         }
 
+        stall_check(now);                              // KBUS cycle hangs? (also while the broker is away)
         watchdog_check(now);                           // also while the broker is away
         steppers_tick(now);
         if (!mqtt_connected(&m.cli))
