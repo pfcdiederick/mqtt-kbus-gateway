@@ -20,6 +20,9 @@
 // "was added" (750-430 8DI, in bits 240..247, all inputs TRUE). Until the bus is
 // opened again, every cycle fails, as the real KBUS does after a change; the
 // next open (rescan) then reports 6 modules. Delete the file to remove it.
+//
+// Hang test (KBUS_SIM_HANG=<file>): while <file> exists, the exchange does not return
+// (like a bus call that hangs inside the WAGO library): tests the hang detector.
 #include "backend.h"
 #include "log.h"
 
@@ -166,6 +169,9 @@ static int sim_exchange(kbus_backend_t *self, const uint8_t *out, size_t out_len
         return -1;
     if (hotplug_present() != sim_extra)
         return -1;                                                 // node changed: bus error until rescan
+    const char *hang = getenv("KBUS_SIM_HANG");
+    while (hang != NULL && *hang != '\0' && access(hang, F_OK) == 0)
+        usleep(50 * 1000);                                         // hangs while the file exists
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     const uint32_t ms = (uint32_t)(now.tv_sec * 1000 + now.tv_nsec / 1000000);

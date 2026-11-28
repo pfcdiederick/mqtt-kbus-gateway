@@ -22,11 +22,13 @@ a { color: var(--green-dark); }
 
 /* ---- header: logo, tab menu, action bar ---- */
 #main-header { position: relative; flex: none; height: 61px; background: var(--bar); border-bottom: 1px solid var(--line);
-  display: flex; align-items: flex-end; padding-left: 160px; }
+  display: flex; align-items: flex-end; padding-left: 300px; }
 #logo { position: absolute; left: 34px; top: 14px; height: 28px; display: flex; align-items: center; }
 #logo img { height: 28px; display: block; }
 #logo .text { display: none; font-weight: 700; font-size: 20px; color: var(--green); letter-spacing: 1px; }
 #logo.noimg img { display: none; } #logo.noimg .text { display: block; }
+#logo .sep { width: 1px; height: 28px; background: var(--line); margin: 0 16px; }
+#logo .site { font-weight: 700; font-size: 15px; color: var(--text); white-space: nowrap; }
 #main-menu { list-style: none; margin: 0; padding: 0; display: flex; align-items: flex-end; height: 61px; position: relative; z-index: 0; }
 #main-menu .tab-item { position: relative; margin: 26px -6px -1px 0; height: 34px; width: 126px; }
 #main-menu .tab-item::before { content: ""; position: absolute; inset: 0 0 0 0; z-index: -1; background: var(--panel);
@@ -152,7 +154,7 @@ body.logged-in .anon-only { display: none !important; }
 #login-err { color: rgb(200, 60, 40); min-height: 1em; margin-top: 8px; font-size: 12px; }
 
 @media (max-width: 900px) {
-  #main-header { padding-left: 120px; } #logo { left: 12px; }
+  #main-header { padding-left: 250px; } #logo { left: 12px; } #logo .sep { margin: 0 10px; }
   #main-menu .tab-item { width: 92px; } #main-menu .tab-item.active { width: 108px; }
   .sub-menu { width: 170px; }
   #action-bar label { display: none; }
